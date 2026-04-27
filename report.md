@@ -407,6 +407,490 @@ def to_json(
 - 返回格式：`{"url": "altair-data-<hash>.json", "format": {"type": "json"}}`
 - Vega-Lite 会自动从 URL 加载数据
 
+#### 1.4.4 禁用行数限制：对不同转换器的差异化行为
+
+`disable_max_rows()` 是一个常用方法，但它对不同数据转换器的行为差异很大。这种差异不是随机的，而是**有明确的设计逻辑和实现机制**。
+
+##### 完整实现机制：三层联动
+
+`disable_max_rows()` 的效果涉及三层机制的联动：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 第一层：disable_max_rows() 方法                                   │
+│   - 条件分支：if self.active in {"default", "vegafusion"}       │
+│   - 决定是否设置 options["max_rows"] = None                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 第二层：get() 方法 → partial 绑定                                 │
+│   - 调用：partial(func, **self._options)                         │
+│   - 将 options 作为关键字参数绑定到转换器函数                     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 第三层：转换器函数签名                                            │
+│   - default_data_transformer(data, max_rows=5000)               │
+│   - vegafusion_data_transformer(data, max_rows=100000)         │
+│   - to_json(data, prefix=..., extension=...)  ← 无 max_rows！   │
+│   - to_csv(data, prefix=..., extension=...)   ← 无 max_rows！   │
+│   - 决定 partial 绑定的参数是否被实际使用                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+##### 第一层：disable_max_rows() 的条件分支
+
+**`disable_max_rows` 方法实现**（`altair/vegalite/data.py:47-54`）：
+
+```python
+class DataTransformerRegistry(_DataTransformerRegistry):
+    def disable_max_rows(self) -> PluginEnabler:
+        """Disable the MaxRowsError."""
+        options = self.options
+        if self.active in {"default", "vegafusion"}:  # ⚠️ 关键条件分支
+            options = options.copy()
+            options["max_rows"] = None
+        return self.enable(**options)
+```
+
+**关键分析：**
+
+| 条件判断 | 当前转换器 | 行为 |
+|---------|-----------|------|
+| `self.active in {"default", "vegafusion"}` | `"default"` | `True` → 设置 `options["max_rows"] = None` |
+| `self.active in {"default", "vegafusion"}` | `"vegafusion"` | `True` → 设置 `options["max_rows"] = None` |
+| `self.active in {"default", "vegafusion"}` | `"json"` | `False` → **不修改 options** |
+| `self.active in {"default", "vegafusion"}` | `"csv"` | `False` → **不修改 options** |
+
+**为什么硬编码 `{"default", "vegafusion"}`？**
+
+这是一个**有争议的设计决策**。从代码结构来看，`PluginRegistry` 是通用的插件注册表，理论上第三方插件也可能需要 `max_rows` 参数。但这个方法直接硬编码了转换器名称，意味着：
+
+1. 第三方自定义转换器即使实现了 `max_rows` 参数，`disable_max_rows()` 对它们也无效
+2. 这种紧耦合设计降低了扩展性
+
+---
+
+##### 第二层：get() 方法的 partial 绑定机制
+
+**`get()` 方法实现**（`altair/utils/plugin_registry.py:262-276`）：
+
+```python
+def get(self) -> partial[R] | Plugin[R] | None:
+    """Return the currently active plugin."""
+    if (func := self._active) and self.plugin_type(func):
+        # ⚠️ 关键：用 partial 绑定 options
+        return partial(func, **self._options) if self._options else func
+    elif self._active is not None:
+        raise TypeError(...)
+    elif TYPE_CHECKING:
+        raise NotImplementedError
+```
+
+**`functools.partial` 的作用：**
+
+`partial` 会"预填充"函数的部分参数，返回一个新的可调用对象。
+
+**场景 1：default 转换器 + disable_max_rows()**
+
+```python
+# 执行 disable_max_rows() 后：
+self._active = default_data_transformer
+self._options = {"max_rows": None}
+
+# get() 返回：
+partial(default_data_transformer, max_rows=None)
+
+# 当 _prepare_data 调用时：
+func = data_transformers.get()  # partial(default_data_transformer, max_rows=None)
+data = func(nw.to_native(data, pass_through=True))
+# 等价于：
+# default_data_transformer(data, max_rows=None)
+```
+
+**场景 2：json 转换器 + disable_max_rows()**
+
+```python
+# 执行 disable_max_rows() 后：
+self._active = to_json
+self._options = {}  # 空！因为条件分支不满足
+
+# get() 返回：
+to_json  # 直接返回函数，没有 partial 包装
+
+# 当 _prepare_data 调用时：
+func = data_transformers.get()  # to_json
+data = func(nw.to_native(data, pass_through=True))
+# 等价于：
+# to_json(data)
+# 没有 max_rows 参数！
+```
+
+**场景 3：json 转换器 + 手动设置 max_rows（无效）**
+
+```python
+# 假设我们手动设置：
+alt.data_transformers.enable("json", max_rows=100)
+
+# get() 返回：
+partial(to_json, max_rows=100)
+
+# 但 to_json 函数签名是：
+def to_json(data, prefix="altair-data", extension="json", ...):
+    # 没有 max_rows 参数！
+
+# 调用时会发生什么？
+# partial(to_json, max_rows=100)(data)
+# 等价于：to_json(data, max_rows=100)
+# 这会抛出 TypeError！因为 to_json 不接受 max_rows 参数
+```
+
+---
+
+##### 第三层：转换器函数签名的差异
+
+这是最根本的差异。让我们对比四个转换器的函数签名：
+
+| 转换器 | 函数签名 | 是否有 `max_rows` 参数 |
+|-------|---------|----------------------|
+| `default` | `default_data_transformer(data, max_rows=5000)` | ✅ 有 |
+| `vegafusion` | `vegafusion_data_transformer(data, max_rows=100000)` | ✅ 有 |
+| `json` | `to_json(data, prefix=..., extension=..., filename=..., urlpath="")` | ❌ **无** |
+| `csv` | `to_csv(data, prefix=..., extension=..., filename=..., urlpath="")` | ❌ **无** |
+
+**default_data_transformer 完整链路：**
+
+```python
+# 1. 转换器定义（有 max_rows）
+def default_data_transformer(data=None, max_rows=5000):
+    if data is None:
+        def pipe(data):
+            data = limit_rows(data, max_rows=max_rows)  # 使用 max_rows
+            return to_values(data)
+        return pipe
+    else:
+        return to_values(limit_rows(data, max_rows=max_rows))
+
+# 2. limit_rows 检查（max_rows=None 时跳过）
+def limit_rows(data, max_rows=5000):
+    if max_rows is None:  # ⚠️ 关键：None 表示不检查
+        return data
+    
+    # 否则检查行数...
+    if nrows > max_rows:
+        raise MaxRowsError(...)
+    return data
+
+# 3. 执行流程
+# default_data_transformer(data, max_rows=None)
+#   → limit_rows(data, max_rows=None)
+#       → max_rows is None → 直接返回，不检查行数
+```
+
+**vegafusion_data_transformer 特殊链路：**
+
+```python
+# 1. 转换器定义（有 max_rows）
+def vegafusion_data_transformer(data=None, max_rows=100000):
+    if data is None:
+        return vegafusion_data_transformer
+    
+    if is_supported_by_vf(data):
+        # 支持的数据类型：不直接检查行数
+        table_name = f"table_{uuid.uuid4()}"
+        extracted_inline_tables[table_name] = data
+        return {"url": VEGAFUSION_PREFIX + table_name}
+    else:
+        # 不支持的类型（如 GeoInterface）：委托给 default
+        return default_data_transformer(data)  # 也受 max_rows 影响
+
+# 2. 行数检查在 VegaFusion 运行时
+def compile_with_vegafusion(vegalite_spec):
+    # 从 options 获取 max_rows
+    row_limit = data_transformers.options.get("max_rows", None)
+    
+    # 传递给 VegaFusion 运行时
+    transformed_vega_spec, warnings = vf.runtime.pre_transform_spec(
+        vega_spec,
+        inline_datasets=inline_tables,
+        row_limit=row_limit,  # ⚠️ 在这里生效
+    )
+    
+    # 检查是否触发行数限制警告
+    handle_row_limit_exceeded(row_limit, warnings)
+```
+
+**to_json 转换器（无行数检查）：**
+
+```python
+# 函数签名：没有 max_rows 参数！
+def to_json(data=None, prefix="altair-data", extension="json", 
+            filename="{prefix}-{hash}.{extension}", urlpath=""):
+    if data is None:
+        return partial(to_json, prefix=prefix, extension=extension, ...)
+    else:
+        # ⚠️ 直接转换，不检查行数！
+        data_str = _data_to_json_string(data)
+        return _to_text(data_str, format=_FormatDict(type="json"))
+```
+
+---
+
+##### 设计逻辑：为什么 json/csv 不检查行数？
+
+这是一个**有意的设计决策**，不是遗漏。让我们分析背后的原因：
+
+| 考量因素 | default 转换器 | json/csv 转换器 |
+|---------|---------------|-----------------|
+| **数据位置** | 内联到 spec 中 | 写入外部文件 |
+| **spec 大小** | 数据越大，spec 越大 | spec 只包含 URL，体积恒定 |
+| **浏览器内存** | 数据全部加载到浏览器内存 | 浏览器按需加载 |
+| **限制目的** | 保护浏览器不崩溃 | 不需要 |
+
+**详细解释：**
+
+1. **default 转换器的场景：**
+
+```python
+# default 转换器输出：
+{
+    "data": {
+        "values": [
+            {"x": 1, "y": 2},
+            {"x": 3, "y": 4},
+            # ... 可能有 100000 行！
+        ]
+    },
+    "mark": "point",
+    ...
+}
+```
+
+- 数据直接内联在 JSON spec 中
+- 整个 spec 通过 Jupyter 通信协议传输
+- 浏览器需要解析整个 spec 并将所有数据加载到内存
+- **100000 行数据可能导致：**
+  - spec 体积巨大（数 MB）
+  - Jupyter 内核与前端通信缓慢
+  - 浏览器内存耗尽甚至崩溃
+
+2. **json 转换器的场景：**
+
+```python
+# json 转换器输出：
+{
+    "data": {
+        "url": "altair-data-abc123.json",  # 只有 URL！
+        "format": {"type": "json"}
+    },
+    "mark": "point",
+    ...
+}
+```
+
+- spec 中只有 URL，体积很小
+- 实际数据写入独立的 JSON 文件
+- 浏览器通过 HTTP 请求加载数据
+- **优势：**
+  - spec 传输高效
+  - 浏览器可以流式加载数据
+  - Vega-Lite 运行时可以渐进式渲染
+
+3. **行数限制的真正目的：**
+
+```python
+class MaxRowsError(Exception):
+    def from_limit_rows(cls, user_rows, max_rows):
+        msg = (
+            f"The number of rows in your dataset ({user_rows}) is greater "
+            f"than the maximum allowed ({max_rows}).\n\n"
+            "Try enabling the VegaFusion data transformer which "
+            "raises this limit by pre-evaluating data\n"
+            "transformations in Python.\n"
+            "    >> import altair as alt\n"
+            '    >> alt.data_transformers.enable("vegafusion")\n\n'
+            "Or, see https://altair-viz.github.io/user_guide/large_datasets.html "
+            "for additional information\n"
+            "on how to plot large datasets."
+        )
+        return cls(msg)
+```
+
+**错误消息中明确建议：**
+- 启用 VegaFusion 转换器（服务端预计算）
+- 或查看"大数据集"文档（使用 json/csv 转换器是方案之一）
+
+这说明 **json/csv 转换器本身就是"大数据集"解决方案的一部分**，因此不需要行数限制。
+
+---
+
+##### 实际行为对比示例
+
+```python
+import altair as alt
+import pandas as pd
+import numpy as np
+
+# 创建 10000 行数据
+df = pd.DataFrame({"x": np.random.randn(10000), "y": np.random.randn(10000)})
+chart = alt.Chart(df).mark_point().encode(x="x", y="y")
+
+# ==================================================================
+# 场景 1：default 转换器（有行数限制）
+# ==================================================================
+print("=== 场景 1: default 转换器 ===")
+
+# 直接显示：抛出 MaxRowsError
+try:
+    chart.display()
+except alt.MaxRowsError as e:
+    print(f"✗ 抛出 MaxRowsError（预期）")
+    print(f"  原因：default 转换器 max_rows=5000，数据有 10000 行")
+
+# 使用 disable_max_rows：有效！
+with alt.data_transformers.disable_max_rows():
+    print(f"✓ disable_max_rows() 后：正常显示")
+    # chart.display()  # 实际工作
+
+# ==================================================================
+# 场景 2：json 转换器（无行数限制）
+# ==================================================================
+print("\n=== 场景 2: json 转换器 ===")
+
+alt.data_transformers.enable("json")
+
+# 直接显示：不会抛错！
+print(f"✓ 直接显示：正常工作（写入 10000 行到 JSON 文件）")
+# chart.display()  # 实际工作
+
+# disable_max_rows：空操作！
+with alt.data_transformers.disable_max_rows():
+    print(f"✓ disable_max_rows() 中：行为相同（空操作）")
+    # chart.display()  # 与之前完全相同
+
+# 验证：options 没有变化
+print(f"  当前 options: {alt.data_transformers.options}")  # {}
+
+# ==================================================================
+# 场景 3：save("chart.png") 的特殊处理
+# ==================================================================
+print("\n=== 场景 3: save('chart.png') ===")
+
+# save() 内部会强制切换到 default 转换器
+# 并禁用行数限制
+
+# 查看 save 函数的实现逻辑：
+# if using_vegafusion():
+#     with data_transformers.disable_max_rows():
+#         perform_save()
+# else:
+#     with data_transformers.enable("default"), data_transformers.disable_max_rows():
+#         perform_save()
+
+print(f"✓ save('chart.png') 会：")
+print(f"  1. 强制切换到 default 转换器")
+print(f"  2. 禁用行数限制")
+print(f"  原因：vl-convert 无法访问本地 JSON/CSV 文件，必须内联数据")
+```
+
+---
+
+##### 完整行为差异总结
+
+| 维度 | default 转换器 | vegafusion 转换器 | json/csv 转换器 |
+|-----|---------------|------------------|-----------------|
+| **函数签名** | 有 `max_rows` 参数 | 有 `max_rows` 参数 | **无** `max_rows` 参数 |
+| **`disable_max_rows()`** | ✓ 设置 `max_rows=None` | ✓ 设置 `max_rows=None` | ✗ **空操作** |
+| **行数检查位置** | `limit_rows()` 函数 | VegaFusion 运行时 | **无** |
+| **数据输出** | `{"values": [...]}` | `{"url": "vegafusion+dataset://..."}` | `{"url": "data.json", ...}` |
+| **数据位置** | 内联到 spec | 服务端内存 | 外部文件 |
+| **设计目的** | 保护浏览器内存 | 保护服务端内存 | **处理大数据** |
+
+---
+
+##### 设计决策的利弊分析
+
+**优势：**
+1. **保护用户**：default 转换器的行数限制防止新手意外导致浏览器崩溃
+2. **分层策略**：不同场景使用不同转换器，各有适用范围
+3. **明确引导**：MaxRowsError 消息引导用户使用正确的大数据方案
+
+**潜在问题：**
+1. **硬编码问题**：`disable_max_rows()` 硬编码 `{"default", "vegafusion"}`，第三方插件无法受益
+2. **行为不一致**：用户可能困惑为什么 `disable_max_rows()` 对 json 转换器无效
+3. **文档依赖**：需要用户阅读文档才能理解不同转换器的行为差异
+
+---
+
+##### save() 函数中的特殊处理
+
+在 `save()` 函数中，Altair 会**强制切换数据转换器**，因为 vl-convert 无法访问本地文件系统：
+
+**`save` 函数中的数据转换器处理**（`altair/utils/save.py:171-284`）：
+
+```python
+def save(...):
+    def perform_save() -> None:
+        spec = chart.to_dict(context={"pre_transform": False})
+        # ... 后续处理
+    
+    if using_vegafusion():
+        # VegaFusion 模式：只禁用行数限制
+        with data_transformers.disable_max_rows():
+            perform_save()
+    else:
+        # 非 VegaFusion 模式：
+        # 1. 强制使用 default 转换器（确保数据内联）
+        # 2. 禁用行数限制
+        with data_transformers.enable("default"), data_transformers.disable_max_rows():
+            perform_save()
+```
+
+**为什么必须强制切换：**
+
+| 场景 | 数据格式 | vl-convert 能否处理 |
+|-----|---------|-------------------|
+| `default` 转换器 | `{"values": [...]}` | ✅ 可以，数据在 spec 中 |
+| `json` 转换器 | `{"url": "data.json"}` | ❌ 无法访问本地文件 |
+| `vegafusion` 转换器 | `{"url": "vegafusion+dataset://..."}` | ✅ 特殊处理（内联数据） |
+
+**VegaFusion 模式的特殊处理：**
+
+```python
+def compile_with_vegafusion(vegalite_spec):
+    # 从 spec 中提取内联表名称
+    inline_names = get_inline_table_names(vega_spec)
+    
+    # 从全局存储中取出 DataFrame
+    table_names = inline_names.intersection(extracted_inline_tables)
+    inline_tables = {k: extracted_inline_tables.pop(k) for k in table_names}
+    
+    # 将数据传递给 VegaFusion 运行时
+    transformed_vega_spec, warnings = vf.runtime.pre_transform_spec(
+        vega_spec,
+        inline_datasets=inline_tables,  # 数据在这里内联
+        row_limit=row_limit,
+    )
+```
+
+VegaFusion 转换器使用 `WeakValueDictionary` 存储 DataFrame，在编译时才内联到 spec 中。
+
+---
+
+##### 行为差异总结
+
+| 场景 | 转换器 | `disable_max_rows()` 效果 | 原因 |
+|-----|-------|--------------------------|------|
+| Jupyter 显示 | `default` | ✓ 禁用 `limit_rows` 检查 | 条件分支满足 + 函数签名匹配 |
+| Jupyter 显示 | `vegafusion` | ✓ 禁用 VegaFusion `row_limit` | 条件分支满足 + 运行时参数 |
+| Jupyter 显示 | `json`/`csv` | ✗ 无效果 | 条件分支不满足 + 函数不匹配 |
+| `save("chart.png")` | 自动切换到 `default` | ✓ 强制内联 + 禁用行数 | vl-convert 无法访问本地文件 |
+| `save("chart.html")` | 当前激活的转换器 | 取决于当前转换器 | HTML 可以引用外部 URL |
+
 ### 1.5 数据清理（Sanitization）机制
 
 #### 1.5.1 Pandas DataFrame 清理
