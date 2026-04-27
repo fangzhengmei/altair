@@ -18,7 +18,279 @@ DataType: TypeAlias = (
 - **SupportsGeoInterface**: 实现 `__geo_interface__` 协议的地理数据对象
 - **DataFrameLike**: 实现 DataFrame Interchange Protocol 的对象
 
-### 1.2 数据类型推断机制
+### 1.1.1 完整数据类型体系：ChartDataType
+
+实际上，`Chart` 类接受的数据类型比 `DataType` 更广泛，定义在 `altair/vegalite/v6/api.py:206`：
+
+```python
+ChartDataType: TypeAlias = Optional[DataType | core.Data | str | core.Generator]
+```
+
+**完整的可接受数据类型：**
+
+| 类型分类 | 具体类型 | 说明 |
+|---------|---------|------|
+| `DataType` | dict, DataFrame, SupportsGeoInterface, DataFrameLike | 走数据转换器的标准路径 |
+| `core.Data` | `InlineData`, `UrlData`, `NamedData` | 原生 Vega-Lite 数据对象，直接使用 |
+| `str` | URL 字符串 | 被转换为 `UrlData` |
+| `core.Generator` | `GraticuleGenerator`, `SphereGenerator`, `SequenceGenerator` | **生成器数据源，绕过数据转换器** |
+
+### 1.2 生成器数据源：绕过转换器的特殊路径
+
+#### 1.2.1 三种生成器类型
+
+Altair 内置三种"生成器数据源"，它们直接使用 Vega-Lite 内置的数据生成逻辑，完全绕过数据转换器：
+
+| 生成器类型 | 工厂函数 | 作用 | Vega-Lite spec 输出 |
+|-----------|---------|------|-------------------|
+| `GraticuleGenerator` | `alt.graticule()` | 生成经纬网格地理数据 | `{"graticule": true}` 或 `{"graticule": {...}}` |
+| `SphereGenerator` | `alt.sphere()` | 生成整个地球球面的 GeoJSON | `{"sphere": true}` |
+| `SequenceGenerator` | `alt.sequence(start, stop, step)` | 生成数值序列 | `{"sequence": {"start": ..., "stop": ...}}` |
+
+**工厂函数实现**（位于 `altair/vegalite/v6/api.py:5462-5487`）：
+
+```python
+@utils.use_signature_func(core.SequenceParams)
+def sequence(
+    start: Optional[float],
+    stop: Optional[float | None] = None,
+    step: Optional[float] = Undefined,
+    as_: Optional[str] = Undefined,
+    **kwds: Any,
+) -> SequenceGenerator:
+    """Sequence generator."""
+    if stop is None:
+        start, stop = 0, start
+    params = core.SequenceParams(start=start, stop=stop, step=step, **{"as": as_})
+    return core.SequenceGenerator(sequence=params, **kwds)
+
+
+@utils.use_signature_func(core.GraticuleParams)
+def graticule(**kwds: Any) -> GraticuleGenerator:
+    """Graticule generator."""
+    graticule: Any = core.GraticuleParams(**kwds) if kwds else True
+    return core.GraticuleGenerator(graticule=graticule)
+
+
+def sphere() -> SphereGenerator:
+    """Sphere generator."""
+    return core.SphereGenerator(sphere=True)
+```
+
+#### 1.2.2 继承关系：为什么它们绕过转换器
+
+生成器类型的继承链（位于 `altair/vegalite/v6/schema/core.py`）：
+
+```
+VegaLiteSchema (基类)
+    │
+    ├── Generator
+    │       ├── GraticuleGenerator
+    │       ├── SphereGenerator
+    │       └── SequenceGenerator
+    │
+    └── Data
+            ├── InlineData
+            ├── UrlData
+            └── NamedData
+```
+
+**关键代码分析 - _prepare_data 函数**（`altair/vegalite/v6/api.py:266-302`）：
+
+```python
+def _prepare_data(
+    data: ChartDataType, context: dict[str, Any] | None = None
+) -> ChartDataType | NamedData | InlineData | UrlData | Any:
+    if data is Undefined:
+        return data
+
+    # 关键条件：非 dict 且是 DataType → 调用数据转换器
+    elif not isinstance(data, dict) and _is_data_type(data):
+        if func := data_transformers.get():
+            data = func(nw.to_native(data, pass_through=True))
+
+    # 字符串 → UrlData
+    elif isinstance(data, str):
+        data = core.UrlData(data)
+
+    # 内联数据合并到顶层 datasets（可选）
+    if context is not None and data_transformers.consolidate_datasets:
+        data = _consolidate_data(data, context)
+
+    if not isinstance(data, (dict, core.Data)):
+        warnings.warn(f"data of type {type(data)} not recognized", stacklevel=1)
+
+    return data
+```
+
+**生成器绕过转换器的原因：**
+
+| 条件判断 | 生成器类型的结果 | 说明 |
+|---------|-----------------|------|
+| `isinstance(data, dict)` | `False` | 生成器是 `Generator` 实例，不是 dict |
+| `_is_data_type(data)` | `False` | 生成器不是 DataFrame、没有 `__geo_interface__` |
+| `not isinstance(data, dict) and _is_data_type(data)` | `False` | 关键条件不满足！ |
+
+**`is_data_type` 函数定义**（`altair/utils/data.py:69-73`）：
+
+```python
+def is_data_type(obj: Any) -> TypeIs[DataType]:
+    return isinstance(obj, (dict, SupportsGeoInterface)) or isinstance(
+        nw.from_native(obj, eager_or_interchange_only=True, pass_through=True),
+        nw.DataFrame,
+    )
+```
+
+生成器类型不满足任何一个条件：
+1. 不是 `dict`
+2. 没有实现 `SupportsGeoInterface` 协议
+3. 无法被 `narwhals.from_native()` 转换为 DataFrame
+
+#### 1.2.3 完整处理流程对比
+
+**普通 DataFrame 数据的处理流程：**
+
+```
+用户: alt.Chart(df)
+         │
+         ▼
+    Chart.data = df
+         │
+         ▼
+    to_dict() 调用 _prepare_data(df, context)
+         │
+         ▼
+    条件判断: not isinstance(df, dict) and is_data_type(df)
+         │
+         ├── isinstance(df, dict)? → False
+         └── is_data_type(df)? → True (DataFrame)
+         │
+         ▼
+    条件满足！调用数据转换器:
+    data_transformers.get() → default_data_transformer
+         │
+         ▼
+    default_data_transformer(df):
+         ├── limit_rows(df, max_rows=5000)  # 行数检查
+         └── to_values(df)                   # 转为 {"values": [...]}
+         │
+         ▼
+    输出: {"values": [...]}
+         │
+         ▼
+    合并到 spec["data"]
+```
+
+**生成器数据源的处理流程：**
+
+```
+用户: alt.Chart(alt.graticule())
+         │
+         ▼
+    Chart.data = GraticuleGenerator(graticule=True)
+         │
+         ▼
+    to_dict() 调用 _prepare_data(data, context)
+         │
+         ▼
+    条件判断: not isinstance(data, dict) and is_data_type(data)
+         │
+         ├── isinstance(data, dict)? → False
+         └── is_data_type(data)? → False (生成器不是 DataType)
+         │
+         ▼
+    条件不满足！跳过数据转换器！
+         │
+         ▼
+    下一个条件: isinstance(data, str)? → False
+         │
+         ▼
+    consolidate_datasets 检查:
+    isinstance(data, (InlineData, dict with values))? → False
+         │
+         ├── 生成器是 Generator，不是 InlineData
+         └── 生成器没有 "values" 键
+         │
+         ▼
+    直接返回原始的 GraticuleGenerator 实例
+         │
+         ▼
+    最终: GraticuleGenerator.to_dict() 被调用
+         │
+         ▼
+    输出: {"graticule": true}
+         │
+         ▼
+    合并到 spec["data"]
+```
+
+#### 1.2.4 最终序列化：SchemaBase.to_dict()
+
+生成器类型最终通过 `SchemaBase.to_dict()` 方法序列化为 Vega-Lite spec：
+
+**GraticuleGenerator 类定义**（`altair/vegalite/v6/schema/core.py:8146-8170`）：
+
+```python
+class GraticuleGenerator(Generator):
+    """
+    GraticuleGenerator schema wrapper.
+    
+    Parameters
+    ----------
+    graticule : dict, Literal[True], :class:`GraticuleParams`
+        Generate graticule GeoJSON data for geographic reference lines.
+    name : str
+        Provide a placeholder name and bind data at runtime.
+    """
+    _schema = {"$ref": "#/definitions/GraticuleGenerator"}
+    
+    def __init__(
+        self,
+        graticule: Any = Undefined,
+        name: Optional[str] = Undefined,
+        **kwds,
+    ):
+        super().__init__(graticule=graticule, name=name, **kwds)
+```
+
+**使用示例：**
+
+```python
+import altair as alt
+from vega_datasets import data
+
+# 1. 使用 graticule 生成器
+graticule = alt.Chart(alt.graticule()).mark_geoshape(stroke="gray")
+
+# 2. 使用 sphere 生成器
+sphere = alt.Chart(alt.sphere()).mark_geoshape(fill="lightblue")
+
+# 3. 使用 sequence 生成器
+seq = alt.Chart(alt.sequence(0, 10, 0.5)).mark_point().encode(
+    x="data:Q",
+    y="data:Q"
+)
+
+# 查看生成的 spec
+print(graticule.to_dict())
+# 输出:
+# {
+#   "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+#   "data": {"graticule": true},  # 不是 {"values": [...]}
+#   "mark": {"type": "geoshape", "stroke": "gray"}
+# }
+```
+
+#### 1.2.5 生成器数据源的设计意图
+
+| 设计考虑 | 说明 |
+|---------|------|
+| **性能优化** | 网格和球面数据是固定模式，Vega-Lite 可以在浏览器端高效生成，无需在 Python 端预计算 |
+| **数据体积** | `{"graticule": true}` 只有十几字节，而实际的 GeoJSON 网格数据可能有数千行 |
+| **延迟计算** | 真正的数据生成延迟到 Vega-Lite 运行时，用户可以在 spec 中调整网格参数 |
+| **地图专用** | Graticule 和 Sphere 是地理可视化的专用辅助数据，无需通用数据转换器处理 |
+
+### 1.3 数据类型推断机制
 
 数据类型的自动推断由 `is_data_type` 函数实现 (`altair/utils/data.py:69-73`)：
 
