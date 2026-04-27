@@ -2725,3 +2725,870 @@ for child in SchemaInfo(info.raw_schema, rootschema=None).allOf:
 | `tools/generate_schema_wrapper.py` | 三文件生成逻辑、`CHANNEL_MIXINS` 模板、`load_schema_with_shorthand_properties()` |
 | `altair/utils/schemapi.py` | `with_property_setters`、`_PropertySetter`、`_replace_parsed_shorthand` |
 
+---
+
+## 15. `from_dict()` 反序列化路径分析
+
+### 15.1 概述
+
+`from_dict()` 是 `to_dict()` 的反向操作，用于将普通 Python 字典（或 JSON 反序列化的结果）重建为 `SchemaBase` 子类实例。
+
+**典型使用场景**:
+```python
+# 从保存的 JSON 重建图表
+import json
+dct = json.load(open("chart.json"))
+chart = alt.Chart.from_dict(dct)
+
+# 或者直接使用
+dct = {
+    "mark": "point",
+    "encoding": {
+        "x": {"field": "price", "type": "quantitative"},
+        "y": {"field": "count", "type": "quantitative"}
+    }
+}
+chart = alt.Chart.from_dict(dct)
+
+# 验证 round-trip
+assert Chart.from_dict(obj.to_dict()).to_dict() == obj.to_dict()
+```
+
+### 15.2 入口：`SchemaBase.from_dict()`
+
+**文件位置**: `altair/utils/schemapi.py:1285-1307`
+
+```python
+@classmethod
+def from_dict(
+    cls: type[TSchemaBase], dct: dict[str, Any], validate: bool = True
+) -> TSchemaBase:
+    """
+    Construct class from a dictionary representation.
+    
+    Parameters
+    ----------
+    dct : dictionary
+        The dict from which to construct the class
+    validate : boolean
+        If True (default), then validate the input against the schema.
+    """
+    # 步骤1：可选验证
+    if validate:
+        cls.validate(dct)  # 使用 jsonschema 验证 dict 格式
+    
+    # 步骤2：创建 _FromDict 转换器
+    # _default_wrapper_classes() 返回所有 SchemaBase 的子类
+    converter = _FromDict(cls._default_wrapper_classes())
+    
+    # 步骤3：执行实际的反序列化
+    return converter.from_dict(dct, cls)
+```
+
+### 15.3 `_FromDict` 转换器类
+
+**文件位置**: `altair/utils/schemapi.py:1469-1623`
+
+**核心设计**：`_FromDict` 维护一个"schema 哈希 → 类列表"的映射表，用于快速查找与给定 schema 匹配的 Python 类。
+
+```python
+class _FromDict:
+    """
+    Class used to construct SchemaBase class hierarchies from a dict.
+    
+    The primary purpose of using this class is to be able to build a hash table
+    that maps schemas to their wrapper classes.
+    """
+    
+    # 计算哈希时排除的键（不影响类型匹配的元数据）
+    _hash_exclude_keys = ("definitions", "title", "description", "$schema", "id")
+
+    def __init__(self, wrapper_classes: Iterable[type[SchemaBase]], /) -> None:
+        # Create a mapping of a schema hash to a list of matching classes
+        # This lets us quickly determine the correct class to construct
+        self.class_dict: dict[int, list[type[SchemaBase]]] = defaultdict(list)
+        
+        # 遍历所有 SchemaBase 子类，构建哈希映射
+        for tp in wrapper_classes:
+            if tp._schema is not None:
+                # 计算 schema 的哈希值
+                schema_hash = self.hash_schema(tp._schema)
+                # 相同哈希的类放在同一个列表中（可能有多个类匹配同一 schema）
+                self.class_dict[schema_hash].append(tp)
+```
+
+### 15.4 Schema 哈希计算
+
+**文件位置**: `altair/utils/schemapi.py:1488-1521`
+
+```python
+@classmethod
+def hash_schema(cls, schema: dict[str, Any], use_json: bool = True) -> int:
+    """
+    Compute a python hash for a nested dictionary which properly handles dicts, lists, sets, and tuples.
+    
+    At the top level, the function excludes from the hashed schema all keys
+    listed in `exclude_keys` (definitions, title, description, $schema, id).
+    """
+    # 步骤1：排除不影响类型匹配的键
+    if cls._hash_exclude_keys and isinstance(schema, dict):
+        schema = {
+            key: val
+            for key, val in schema.items()
+            if key not in cls._hash_exclude_keys
+        }
+    
+    # 步骤2：两种哈希方式（默认使用 JSON 方式）
+    if use_json:
+        # JSON 序列化 + 字符串哈希
+        s = json.dumps(schema, sort_keys=True)
+        return hash(s)
+    else:
+        # 递归冻结为可哈希类型
+        def _freeze(val):
+            if isinstance(val, dict):
+                return frozenset((k, _freeze(v)) for k, v in val.items())
+            elif isinstance(val, set):
+                return frozenset(map(_freeze, val))
+            elif isinstance(val, (list, tuple)):
+                return tuple(map(_freeze, val))
+            else:
+                return val
+        
+        return hash(_freeze(schema))
+```
+
+**哈希设计要点**:
+- `_hash_exclude_keys` 排除 `definitions` 等元数据，因为它们不影响类型匹配
+- `sort_keys=True` 确保字典键顺序不影响哈希
+- 两种方式（JSON 方式通常更快）
+
+### 15.5 `_FromDict.from_dict()` 核心逻辑
+
+**文件位置**: `altair/utils/schemapi.py:1568-1623`
+
+这是反序列化的核心递归函数。
+
+```python
+def from_dict(
+    self,
+    dct: dict[str, Any] | list[dict[str, Any]] | TSchemaBase,
+    tp: type[TSchemaBase] | None = None,
+    schema: dict[str, Any] | None = None,
+    rootschema: dict[str, Any] | None = None,
+    default_class: Any = _passthrough,
+) -> TSchemaBase | SchemaBase:
+    """Construct an object from a dict representation."""
+    
+    target_tp: Any        # 最终要实例化的类
+    current_schema: dict[str, Any]  # 当前使用的 schema
+
+    # ===== 阶段1：确定目标类型和 schema =====
+    
+    # 情况1：已经是 SchemaBase 实例，直接返回
+    if isinstance(dct, SchemaBase):
+        return dct
+    
+    # 情况2：明确指定了目标类型 tp
+    elif tp is not None:
+        current_schema = tp._schema
+        # 使用 tp 的 _rootschema 作为根
+        root_schema: dict[str, Any] = rootschema or tp._rootschema or current_schema
+        target_tp = tp
+    
+    # 情况3：提供了 schema，通过哈希查找匹配的类
+    elif schema is not None:
+        # 如果有多个匹配，使用第一个（class_dict 是广度优先构建的，第一个是最通用的）
+        current_schema = schema
+        root_schema = rootschema or current_schema
+        # 通过哈希查找匹配的类列表
+        matches = self.class_dict[self.hash_schema(current_schema)]
+        target_tp = matches[0] if matches else default_class
+    
+    else:
+        msg = "Must provide either `tp` or `schema`, but not both."
+        raise ValueError(msg)
+
+    # ===== 阶段2：准备递归调用 =====
+    
+    # 创建部分应用函数（绑定 root_schema）
+    from_dict = partial(self.from_dict, rootschema=root_schema)
+    
+    # 关键：解析当前 schema 中的 $ref 引用
+    # 这是运行时 $ref 解析的核心入口！
+    resolved = _resolve_references(current_schema, root_schema)
+
+    # ===== 阶段3：处理 anyOf/oneOf（Union 类型） =====
+    
+    if "anyOf" in resolved or "oneOf" in resolved:
+        # 收集所有可能的 schema
+        schemas = resolved.get("anyOf", []) + resolved.get("oneOf", [])
+        
+        # 逐个尝试验证，找到第一个匹配的 schema
+        for possible in schemas:
+            try:
+                # 使用 jsonschema 验证 dct 是否符合 possible schema
+                validate_jsonschema(dct, possible, rootschema=root_schema)
+            except jsonschema.ValidationError:
+                # 不匹配，继续下一个
+                continue
+            else:
+                # 找到匹配的！递归使用这个 schema
+                return from_dict(dct, schema=possible, default_class=target_tp)
+
+    # ===== 阶段4：根据数据类型递归处理 =====
+    
+    # 情况A：dict 类型 → 递归处理每个属性
+    if _is_dict(dct):
+        # 获取 schema 中定义的 properties
+        props: dict[str, Any] = resolved.get("properties", {})
+        
+        # 遍历 dict 的每个键值对
+        # 对于在 schema properties 中定义的键，递归调用 from_dict
+        # 对于未定义的键（additionalProperties），保持原值
+        kwds = {
+            k: (from_dict(v, schema=props[k]) if k in props else v)
+            for k, v in dct.items()
+        }
+        
+        # 实例化目标类
+        return target_tp(**kwds)
+    
+    # 情况B：list 类型 → 递归处理每个元素
+    elif _is_list(dct):
+        # 获取 items schema（数组元素的类型）
+        item_schema: dict[str, Any] = resolved.get("items", {})
+        
+        # 对每个元素递归调用 from_dict
+        return target_tp([from_dict(k, schema=item_schema) for k in dct])
+    
+    # 情况C：其他类型（基本类型）→ 直接传入
+    else:
+        # NOTE: Unsure what is valid here
+        return target_tp(dct)
+```
+
+### 15.6 API 层的 `Chart.from_dict()`
+
+**文件位置**: `altair/vegalite/v6/api.py:4114-4141`
+
+`Chart` 类有一个特殊的 `from_dict()` 实现，用于智能识别图表类型。
+
+```python
+@classmethod
+def from_dict(
+    cls: type[_TSchemaBase], dct: dict[str, Any], validate: bool = True
+) -> _TSchemaBase:
+    """
+    Construct a ``Chart`` from a dictionary representation.
+    
+    特殊行为：智能识别图表类型
+    """
+    _tp: Any
+    
+    # 步骤1：遍历所有 TopLevelMixin 子类尝试匹配
+    # TopLevelMixin 子类包括：Chart, LayerChart, FacetChart, HConcatChart, VConcatChart, RepeatChart
+    for tp in TopLevelMixin.__subclasses__():
+        # 对于 Chart 类自身，使用 super()（即 SchemaBase.from_dict）
+        _tp = super() if tp is Chart else tp
+        try:
+            # 尝试用当前类型反序列化
+            return _tp.from_dict(dct, validate=validate)
+        except jsonschema.ValidationError:
+            # 验证失败，继续下一个类型
+            pass
+
+    # 步骤2：最后尝试用 core.Root（最通用的顶层 spec）
+    return t.cast("_TSchemaBase", core.Root.from_dict(dct, validate))
+```
+
+**设计意图**:
+- 用户保存的 JSON 可能是任意类型的图表（layered, faceted, concatenated 等）
+- 通过遍历 `TopLevelMixin` 子类，自动识别并返回正确的类型
+- 最后兜底使用 `core.Root`，它可以匹配任何 Vega-Lite spec
+
+### 15.7 反序列化完整流程图
+
+```
+用户调用: Chart.from_dict(dct)
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 1. Chart.from_dict() (api.py)                                 │
+│    - 遍历 TopLevelMixin 子类（Chart, LayerChart, 等）        │
+│    - 逐个尝试 from_dict，找到第一个验证通过的                  │
+│    - 最后兜底 core.Root                                       │
+└──────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 2. SchemaBase.from_dict() (schemapi.py:1285-1307)          │
+│    - 验证 dct 是否符合 cls._schema                            │
+│    - 创建 _FromDict 转换器                                    │
+│    - 调用 converter.from_dict(dct, cls)                       │
+└──────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 3. _FromDict.from_dict() (schemapi.py:1568-1623)            │
+│    │
+│    ├──► 阶段1：确定目标类型
+│    │     - tp 已知 → 使用 tp._schema 和 tp._rootschema
+│    │     - schema 已知 → 哈希查找 class_dict
+│    │
+│    ├──► 阶段2：运行时 $ref 解析
+│    │     resolved = _resolve_references(current_schema, root_schema)
+│    │
+│    ├──► 阶段3：处理 Union (anyOf/oneOf)
+│    │     - 逐个尝试验证，找到匹配的 schema
+│    │     - 递归调用 from_dict 使用匹配的 schema
+│    │
+│    └──► 阶段4：根据数据类型递归
+│          ├──► dict: 遍历 properties，递归每个属性
+│          ├──► list: 遍历 items，递归每个元素
+│          └──► 其他: 直接 target_tp(dct)
+└──────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 4. SchemaBase.__init__()                                      │
+│    - 存储 _args 和 _kwds                                       │
+│    - 如果 DEBUG_MODE，执行即时验证                             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 15.8 反序列化示例分析
+
+**示例数据**:
+```python
+dct = {
+    "mark": "point",
+    "encoding": {
+        "x": {"field": "price", "type": "quantitative"},
+        "y": {"aggregate": "count", "type": "quantitative"}
+    }
+}
+```
+
+**执行流程**:
+
+```
+1. Chart.from_dict(dct)
+   → 验证 dct 符合 Chart 的 schema
+   → 创建 _FromDict，包含所有 SchemaBase 子类
+   → 调用 converter.from_dict(dct, Chart)
+
+2. converter.from_dict(dct, tp=Chart)
+   → current_schema = Chart._schema
+   → root_schema = Chart._rootschema (完整的 Vega-Lite schema)
+   → resolved = _resolve_references(Chart._schema, root_schema)
+        → 展开 $ref，得到完整的 spec 定义
+   
+   → 检查 resolved 有没有 anyOf/oneOf?
+        → 如果是顶层 spec，可能有（如 UnitSpec | LayerSpec 等）
+        → 逐个验证，找到匹配的
+   
+   → 处理 dict 类型
+        → props = resolved.get("properties", {})
+            → 包括 mark, encoding, data, transform 等
+        → kwds = {
+            "mark": dct["mark"],  # 字符串，不在 properties? 直接保留
+            "encoding": from_dict(
+                {"x": ..., "y": ...},
+                schema=props["encoding"]  # FacetedEncoding 的 schema
+            )
+          }
+
+3. 递归处理 encoding
+   → encoding 的 schema 是 {"$ref": "#/definitions/FacetedEncoding"}
+   → resolved = _resolve_references(encoding_schema, root_schema)
+        → 展开得到 properties: x, y, color, size, 等
+   
+   → 处理 dict: {"x": ..., "y": ...}
+        → props["x"] 的 schema 是 anyOf [...]
+            → 检查 anyOf，验证 {"field": "price", "type": "quantitative"}
+            → 找到匹配的 schema（如 FieldDef）
+            → 递归 from_dict 使用 FieldDef schema
+        → 同理处理 y
+
+4. 递归处理 x: {"field": "price", "type": "quantitative"}
+   → 匹配到 FieldDef schema
+   → 处理 dict
+        → props["field"] 是 string 类型 → 不递归，直接保留
+        → props["type"] 是 enum 类型 → 直接保留
+   → 返回 FieldDef(field="price", type="quantitative")
+
+5. 最终实例化
+   → Chart(
+        mark="point",
+        encoding=FacetedEncoding(
+            x=FieldDef(field="price", type="quantitative"),
+            y=FieldDef(aggregate="count", type="quantitative")
+        )
+     )
+```
+
+### 15.9 关键设计点
+
+| 设计点 | 说明 |
+|--------|------|
+| **Schema 哈希映射** | 预计算所有类的 schema 哈希，O(1) 查找匹配类 |
+| **`_rootschema` 运行时解析** | 反序列化时动态展开 `$ref`，不需要预展开所有 schema |
+| **anyOf/oneOf 尝试验证** | 对于 Union 类型，逐个尝试 jsonschema 验证找到匹配 |
+| **按 properties 递归** | 只有在 schema properties 中定义的键才递归反序列化 |
+| **Chart 智能识别** | 遍历 `TopLevelMixin` 子类自动识别图表类型 |
+
+---
+
+## 16. 运行时 `$ref` 引用解析链
+
+### 16.1 概述
+
+`$ref` 是 JSON Schema 的引用机制，允许在 schema 中引用其他定义。Altair 在两个阶段处理 `$ref`：
+
+| 阶段 | 处理方式 | 目的 |
+|------|---------|------|
+| **代码生成阶段** | 解析并合并（`allOf`），提取类型信息 | 生成正确的 Python 类型和类继承关系 |
+| **运行时阶段** | 动态展开 `$ref` | 验证、反序列化、属性访问 |
+
+### 16.2 `_rootschema` 类属性
+
+**文件位置**: `altair/utils/schemapi.py:1073-1074`
+
+```python
+class SchemaBase:
+    _schema: ClassVar[dict[str, Any] | Any] = None
+    _rootschema: ClassVar[dict[str, Any] | None] = None
+```
+
+**设计意图**:
+- `_schema`: 当前类对应的 schema（通常是 `$ref` 引用，如 `{'$ref': '#/definitions/FieldDef'}`）
+- `_rootschema`: **完整的根 schema**，包含所有 `definitions`（用于解析 `$ref` 引用）
+
+**生成的代码示例** (`core.py`):
+```python
+class VegaLiteSchema(SchemaBase):
+    # _rootschema 存储完整的 Vega-Lite schema（包括所有 definitions）
+    _rootschema = load_schema()
+    
+    @classmethod
+    def _default_wrapper_classes(cls) -> Iterator[type[Any]]:
+        return _subclasses(VegaLiteSchema)
+
+
+class FieldDef(VegaLiteSchema):
+    # _schema 只是一个 $ref 引用
+    _schema = {'$ref': '#/definitions/FieldDef'}
+    # _rootschema 继承自 VegaLiteSchema（完整 schema）
+    _rootschema = VegaLiteSchema._rootschema
+```
+
+### 16.3 `_resolve_references()` 运行时解析
+
+**文件位置**: `altair/utils/schemapi.py:562-581`
+
+这是运行时 `$ref` 解析的核心函数。
+
+```python
+def _resolve_references(
+    schema: dict[str, Any], rootschema: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """
+    Resolve schema references until there is no $ref anymore in the top-level of the dictionary.
+    
+    注意：只解析顶层的 $ref，不递归解析嵌套的 $ref（除非展开后还有 $ref）。
+    """
+    
+    # 两种实现方式：使用 referencing 库 或 jsonschema.RefResolver
+    
+    if _use_referencing_library():
+        # 现代方式：使用 referencing 库
+        registry = _get_referencing_registry(rootschema or schema)
+        referencing_resolver = registry.resolver()
+        
+        # 循环解析直到没有 $ref
+        while "$ref" in schema:
+            # 构建完整 URI 并查找
+            # _VEGA_LITE_ROOT_URI = "https://vega.github.io/schema/vega-lite/v6.json"
+            schema = referencing_resolver.lookup(
+                _VEGA_LITE_ROOT_URI + schema["$ref"]
+            ).contents
+    else:
+        # 传统方式：使用 jsonschema.RefResolver
+        resolver = jsonschema.RefResolver.from_schema(rootschema or schema)
+        
+        while "$ref" in schema:
+            with resolver.resolving(schema["$ref"]) as resolved:
+                schema = resolved
+    
+    return schema
+```
+
+**关键特性**:
+1. **循环解析**：如果展开后的 schema 仍然有 `$ref`，继续解析
+2. **顶层解析**：只处理顶层的 `$ref`，不自动递归解析嵌套属性中的 `$ref`
+3. **两种实现**：优先使用 `referencing` 库（更现代），回退到 `jsonschema.RefResolver`
+
+### 16.4 `SchemaBase.resolve_references()` 方法
+
+**文件位置**: `altair/utils/schemapi.py:1350-1358`
+
+提供便捷的类方法，使用类自身的 `_schema` 和 `_rootschema`。
+
+```python
+@classmethod
+def resolve_references(cls, schema: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve references in the context of this object's schema or root schema."""
+    # 使用传入的 schema，或类的 _schema
+    schema_to_pass = schema or cls._schema
+    
+    # 使用类的 _rootschema 作为根
+    return _resolve_references(
+        schema=schema_to_pass,
+        rootschema=(cls._rootschema or cls._schema or schema),
+    )
+```
+
+### 16.5 运行时 `$ref` 解析的使用场景
+
+`_resolve_references` 在以下运行时场景被调用：
+
+#### 场景1：`from_dict()` 反序列化
+
+**文件位置**: `altair/utils/schemapi.py:1599`
+
+```python
+def from_dict(...):
+    # ...
+    resolved = _resolve_references(current_schema, root_schema)
+    # 使用 resolved schema 处理 anyOf、properties、items 等
+    if "anyOf" in resolved or "oneOf" in resolved:
+        schemas = resolved.get("anyOf", []) + resolved.get("oneOf", [])
+        # ...
+    props: dict[str, Any] = resolved.get("properties", {})
+    # ...
+```
+
+**目的**：展开 `$ref` 后才能正确访问 `properties`、`anyOf` 等关键字。
+
+#### 场景2：`validate()` 验证
+
+**文件位置**: `altair/utils/schemapi.py:1338-1347`
+
+```python
+@classmethod
+def validate(cls, instance: dict[str, Any], schema: dict[str, Any] | None = None) -> None:
+    if schema is None:
+        schema = cls._schema
+    # 注意：这里没有显式调用 resolve_references
+    # 而是直接传递给 validate_jsonschema，由 jsonschema 内部处理
+    
+    validate_jsonschema(instance, schema, rootschema=cls._rootschema or cls._schema)
+```
+
+**关键**：`validate_jsonschema` 本身会使用 `rootschema` 解析 `$ref`，不需要预展开。
+
+#### 场景3：`validate_property()` 验证单个属性
+
+**文件位置**: `altair/utils/schemapi.py:1360-1370`
+
+```python
+@classmethod
+def validate_property(cls, name: str, value: Any, schema: dict[str, Any] | None = None) -> None:
+    # 先解析引用以获取 properties
+    props = cls.resolve_references(schema or cls._schema).get("properties", {})
+    # 使用具体属性的 schema 验证
+    validate_jsonschema(
+        value, props.get(name, {}), rootschema=cls._rootschema or cls._schema
+    )
+```
+
+**目的**：需要展开 `$ref` 才能访问 `properties` 字典。
+
+#### 场景4：`with_property_setters` 装饰器
+
+**文件位置**: `altair/utils/schemapi.py:1675-1680`
+
+```python
+def with_property_setters(cls: type[TSchemaBase]) -> type[TSchemaBase]:
+    """Decorator to add property setters to a Schema class."""
+    # 解析引用以获取完整的 properties 列表
+    schema = cls.resolve_references()
+    for prop, propschema in schema.get("properties", {}).items():
+        # 为每个属性创建 _PropertySetter 描述符
+        setattr(cls, prop, _PropertySetter(prop, propschema))
+    return cls
+```
+
+**目的**：需要展开 `$ref` 才能知道有哪些属性需要创建 setter。
+
+### 16.6 代码生成阶段 vs 运行时阶段对比
+
+#### 代码生成阶段的 `$ref` 处理
+
+**文件位置**: `tools/schemapi/utils.py:372-375`
+
+```python
+class SchemaInfo:
+    def __init__(self, schema: Mapping[str, Any], rootschema: Mapping[str, Any] | None = None) -> None:
+        object.__setattr__(self, "raw_schema", schema)
+        object.__setattr__(self, "rootschema", rootschema)
+        # 关键：在构造时就解析引用！
+        object.__setattr__(self, "schema", resolve_references(schema, rootschema))
+```
+
+**代码生成阶段的特点**：
+
+| 特点 | 说明 |
+|------|------|
+| **即时解析** | `SchemaInfo` 构造时就调用 `resolve_references` |
+| **`raw_schema` 保留原始** | 通过 `self.raw_schema` 可以访问原始 `$ref` |
+| **`allOf` 合并** | `resolve_references` 同时合并 `allOf` 的属性 |
+| **`refname` 提取** | 从 `$ref` 提取类名用于继承关系 |
+
+**代码生成中使用 `$ref` 的场景**：
+
+```python
+# 场景1：获取类名（用于继承关系）
+@property
+def refname(self) -> str:
+    # 从 raw_schema 提取，不使用已解析的 schema
+    return self.raw_schema.get("$ref", "#/").split("/")[-1]
+
+def is_reference(self) -> bool:
+    # 检查 raw_schema，不使用已解析的 schema
+    return "$ref" in self.raw_schema
+
+# 场景2：构建依赖关系图（subclasses()）
+def subclasses(self) -> Iterator[str]:
+    # 遍历 anyOf 中的引用
+    for child in SchemaInfo(self.schema, self.rootschema).anyOf:
+        if child.is_reference():
+            yield child.refname
+```
+
+#### 两阶段对比总结
+
+| 维度 | 代码生成阶段 | 运行时阶段 |
+|------|-------------|-----------|
+| **核心函数** | `tools.schemapi.schemapi._resolve_references` (导入为 `resolve_references`) | `altair.utils.schemapi._resolve_references` |
+| **解析时机** | `SchemaInfo` 构造时即时解析 | 需要时动态解析（延迟） |
+| **数据存储** | `self.schema` 存储解析后，`self.raw_schema` 保留原始 | 类属性 `_schema` 保留 `$ref`，`_rootschema` 存储完整定义 |
+| **allOf 处理** | 合并到 `properties` | 交给 jsonschema 处理 |
+| **主要用途** | 类型推断、类继承、`@overload` 生成 | 验证、反序列化、属性访问 |
+| **引用展开** | 完整展开，用于代码生成 | 按需展开，通常只展开顶层 |
+
+### 16.7 为什么需要两个阶段？
+
+**设计原因分析**：
+
+1. **代码生成阶段：需要完整信息**
+   - 要生成正确的类型注解，必须知道 schema 的完整结构
+   - 要建立类继承关系，必须知道 `anyOf` 中的引用指向哪个类
+   - `allOf` 必须合并才能知道完整的 `properties` 列表
+
+2. **运行时阶段：延迟解析更高效**
+   - 不是所有 `$ref` 都需要展开
+   - 保持 `_schema` 为 `$ref` 引用可以节省内存（不需要复制整个 schema）
+   - `jsonschema` 内部会处理 `$ref`，不需要预展开
+
+3. **关注点分离**
+   - 代码生成：静态分析、类型推导、代码结构
+   - 运行时：动态处理、验证、序列化/反序列化
+
+### 16.8 `$ref` 解析完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        代码生成阶段                                   │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 1. SchemaInfo.__init__(schema, rootschema)                          │
+│    │                                                                  │
+│    ├──► self.raw_schema = schema (保留原始 $ref)                    │
+│    ├──► self.rootschema = rootschema                                │
+│    └──► self.schema = resolve_references(schema, rootschema)       │
+│         │                                                            │
+│         ├──► 循环解析顶层 $ref                                      │
+│         ├──► 合并 allOf 的 properties                               │
+│         └──► 返回"展开后"的 schema                                  │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 2. 代码生成使用                                                       │
+│    │                                                                  │
+│    ├──► SchemaInfo.refname: 从 raw_schema 提取类名                  │
+│    ├──► SchemaInfo.is_reference(): 检查 raw_schema 有无 $ref        │
+│    ├──► subclasses(): 遍历 anyOf 中的引用建立依赖关系               │
+│    └──► to_type_repr(): 使用展开的 schema 生成类型注解               │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 3. 生成的代码                                                         │
+│    class VegaLiteSchema(SchemaBase):                                 │
+│        _rootschema = load_schema()  # 完整 schema (含 definitions)  │
+│                                                                    │
+│    class FieldDef(VegaLiteSchema):                                   │
+│        _schema = {'$ref': '#/definitions/FieldDef'}  # 保留 $ref   │
+│        _rootschema = VegaLiteSchema._rootschema                      │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ 运行时
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        运行时阶段                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 场景1: from_dict() 反序列化                                           │
+│    resolved = _resolve_references(current_schema, root_schema)      │
+│         │                                                             │
+│         ├──► 使用 current_schema (可能是 $ref)                       │
+│         ├──► 使用 root_schema (完整 schema) 解析                     │
+│         └──► 返回展开后的 schema                                      │
+│                                                                    │
+│    → 用于: 检查 anyOf, 获取 properties, 递归反序列化                 │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 场景2: validate_property() 验证                                       │
+│    props = cls.resolve_references().get("properties", {})           │
+│    → 展开 $ref 以访问 properties 字典                                 │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 场景3: with_property_setters 装饰器                                   │
+│    schema = cls.resolve_references()                                  │
+│    → 展开 $ref 以获取完整的 properties 列表                           │
+│    → 为每个属性创建 _PropertySetter                                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 场景4: validate() 验证（不需要预展开）                                 │
+│    validate_jsonschema(instance, schema, rootschema=...)             │
+│    → jsonschema 内部使用 rootschema 解析 $ref                        │
+│    → 不需要显式调用 resolve_references                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 16.9 关键数据结构对比
+
+| 结构 | 代码生成阶段 | 运行时阶段 |
+|------|-------------|-----------|
+| **`_schema`** | 不使用（使用 `SchemaInfo.schema`） | 类属性，保留 `$ref` 引用 |
+| **`_rootschema`** | 作为参数传入 `SchemaInfo` | 类属性，存储完整 schema（含 definitions） |
+| **`SchemaInfo.raw_schema`** | 保留原始 `$ref`，用于 `refname`、`is_reference()` | 不使用 |
+| **`SchemaInfo.schema`** | 已展开，用于类型分析 | 不使用 |
+
+---
+
+## 17. 第二轮补充总结
+
+### 17.1 `from_dict()` 反序列化速查表
+
+```
+输入: dct = {"mark": "point", "encoding": {"x": {...}, "y": {...}}}
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 1. 入口: SchemaBase.from_dict(dct, validate=True)            │
+│    - 验证 dct 符合 cls._schema                                 │
+│    - 创建 _FromDict 转换器                                     │
+└──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 2. _FromDict 初始化                                            │
+│    - 遍历所有 SchemaBase 子类                                   │
+│    - 计算每个类 _schema 的哈希值                                │
+│    - 构建 class_dict: {hash: [Class1, Class2, ...]}          │
+└──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 3. _FromDict.from_dict() 核心逻辑                             │
+│    │
+│    ├──► 阶段1：确定目标类型
+│    │     - tp 已知: 使用 tp._schema 和 tp._rootschema
+│    │     - schema 已知: 哈希查找 class_dict
+│    │
+│    ├──► 阶段2：运行时 $ref 解析
+│    │     resolved = _resolve_references(current_schema, root_schema)
+│    │
+│    ├──► 阶段3：处理 Union (anyOf/oneOf)
+│    │     - 逐个尝试 jsonschema 验证
+│    │     - 找到第一个匹配的 schema
+│    │     - 递归调用 from_dict
+│    │
+│    └──► 阶段4：按类型递归
+│          ├──► dict: 遍历 properties，递归每个值
+│          ├──► list: 遍历 items，递归每个元素
+│          └──► 其他: 直接 target_tp(dct)
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 17.2 两阶段 `$ref` 处理对比表
+
+| 维度 | 代码生成阶段 | 运行时阶段 |
+|------|-------------|-----------|
+| **核心函数** | `tools.schemapi.schemapi._resolve_references` | `altair.utils.schemapi._resolve_references` |
+| **触发时机** | `SchemaInfo` 构造时即时解析 | 需要时动态解析 |
+| **解析方式** | 完整展开 + `allOf` 合并 | 按需展开顶层 |
+| **原始引用保留** | `SchemaInfo.raw_schema` | 类属性 `_schema` |
+| **完整定义存储** | `rootschema` 参数 | 类属性 `_rootschema` |
+| **主要用途** | 类型推断、类继承、代码生成 | 验证、反序列化、属性访问 |
+| **`allOf` 处理** | 预合并到 `properties` | 交给 jsonschema |
+| **`anyOf` 处理** | 生成 `Union` 类型和 `@overload` | 运行时尝试验证匹配 |
+
+### 17.3 `_rootschema` 使用场景汇总
+
+| 场景 | 代码位置 | 用途 |
+|------|---------|------|
+| **`validate()`** | `schemapi.py:1347` | 传递给 `validate_jsonschema` 解析 `$ref` |
+| **`resolve_references()`** | `schemapi.py:1357` | 作为根 schema 解析 `$ref` |
+| **`validate_property()`** | `schemapi.py:1369` | 传递给 `validate_jsonschema` |
+| **`from_dict()`** | `schemapi.py:1583,1590,1599` | 解析 `$ref`、验证匹配 |
+| **`with_property_setters`** | `schemapi.py:1677` | 间接通过 `resolve_references()` |
+
+### 17.4 关键设计亮点（第二轮补充）
+
+1. **Schema 哈希映射的高效查找**
+   - 预计算所有 `SchemaBase` 子类的 schema 哈希
+   - `_hash_exclude_keys` 排除不影响类型匹配的元数据（`definitions`, `title`, `description` 等）
+   - 反序列化时 O(1) 哈希查找匹配类
+
+2. **`anyOf` 运行时尝试验证**
+   - 代码生成阶段：生成 `Union` 类型和 `@overload`
+   - 运行时阶段：无法静态确定具体类型，逐个 `validate_jsonschema` 尝试
+   - 找到第一个匹配的 schema 后递归处理
+
+3. **两阶段 `$ref` 处理的关注点分离**
+   - **代码生成**：完整展开用于类型分析和代码生成
+   - **运行时**：延迟解析，按需展开，节省内存
+   - `raw_schema` vs `schema` 的区分让代码生成器既能访问原始引用，又能使用展开后的结构
+
+4. **按 properties 递归的精确控制**
+   - 只有在 schema `properties` 中定义的键才递归反序列化
+   - 未定义的键（`additionalProperties`）保持原样
+   - 避免过度处理，保持与 schema 定义一致
+
+### 17.5 第二轮补充参考文件位置
+
+| 文件 | 说明 |
+|------|------|
+| `altair/utils/schemapi.py:1285-1307` | `SchemaBase.from_dict()` 入口 |
+| `altair/utils/schemapi.py:1469-1623` | `_FromDict` 转换器类完整实现 |
+| `altair/utils/schemapi.py:562-581` | `_resolve_references()` 运行时解析 |
+| `altair/utils/schemapi.py:1350-1358` | `SchemaBase.resolve_references()` 方法 |
+| `altair/vegalite/v6/api.py:4114-4141` | `Chart.from_dict()` 智能类型识别 |
+| `tools/schemapi/utils.py:372-375` | `SchemaInfo` 构造时即时解析 `$ref` |
+| `tools/schemapi/utils.py:701-706` | `refname`、`ref` 从 `raw_schema` 提取 |
+
