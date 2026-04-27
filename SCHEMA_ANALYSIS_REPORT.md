@@ -3592,3 +3592,566 @@ def subclasses(self) -> Iterator[str]:
 | `tools/schemapi/utils.py:372-375` | `SchemaInfo` 构造时即时解析 `$ref` |
 | `tools/schemapi/utils.py:701-706` | `refname`、`ref` 从 `raw_schema` 提取 |
 
+---
+
+## 18. `@use_signature` 装饰器机制
+
+### 18.1 概述
+
+`@use_signature` 和 `@use_signature_func` 是两个运行时装饰器，用于将一个类或函数的参数签名复制到另一个函数/方法上。这是一种"间接签名注入"机制，用于解决以下问题：
+
+1. **代码生成与手动编写的方法需要同步签名**
+2. **IDE 自动补全和类型检查支持**
+3. **文档自动继承与更新**
+
+**典型使用场景**:
+- `mixins.py` 中的 `mark_point()`、`configure_axis()` 等方法
+- `api.py` 中的 `binding_checkbox()`、`binding_select()` 等便利函数
+- 子类化 `SchemaBase` 派生类时继承签名
+
+### 18.2 为什么需要这种间接机制？
+
+**直接写死签名的问题**：
+
+```python
+# 假设 MarkDef 有以下参数
+class MarkDef:
+    def __init__(
+        self,
+        color: Optional[str] = Undefined,
+        filled: Optional[bool] = Undefined,
+        opacity: Optional[float] = Undefined,
+        # ... 还有几十个参数
+    ): ...
+
+# 问题1：如果直接写死，代码重复且难以维护
+class MarkMethodMixin:
+    def mark_point(self, color=None, filled=None, opacity=None, ...):  # 重复几十次！
+        copy = self.copy(deep=False)
+        copy.mark = core.MarkDef(type="point", color=color, filled=filled, ...)
+        return copy
+
+# 问题2：MarkDef 签名变化时，mark_point 等方法需要同步更新
+# 问题3：类型注解和文档需要手动维护
+```
+
+**使用 `@use_signature` 的优势**：
+
+```python
+# 代码简洁，签名自动从 MarkDef 继承
+class MarkMethodMixin:
+    @use_signature(_MarkDef)
+    def mark_point(self, **kwds: Any) -> Self:
+        """Set the chart's mark to 'point' (see :class:`MarkDef`)."""
+        copy = self.copy(deep=False)
+        if any(val is not Undefined for val in kwds.values()):
+            copy.mark = core.MarkDef(type="point", **kwds)
+        else:
+            copy.mark = "point"
+        return copy
+
+# 优势：
+# 1. 代码简洁，使用 **kwds 传递参数
+# 2. 签名自动从 MarkDef 继承，MarkDef 变化时自动同步
+# 3. 文档自动继承（通过 __wrapped__ 属性）
+# 4. IDE 自动补全和类型检查正常工作
+```
+
+### 18.3 `@use_signature` 与 `@use_signature_func` 的实现
+
+**文件位置**: `altair/utils/core.py:759-792`
+
+#### 类型定义与协议
+
+```python
+# 方法签名复制器协议
+class _MethodSignatureCopier(Protocol[P]):
+    def __call__(self, cb: WrapsMethod[T, R], /) -> WrappedMethod[T, P, R]: ...
+
+# 函数签名复制器协议
+class _FunctionSignatureCopier(Protocol[P]):
+    def __call__(self, cb: Callable[..., R], /) -> Callable[P, R]: ...
+```
+
+#### `use_signature` 装饰器（用于方法）
+
+```python
+def use_signature(tp: Callable[P, Any], /) -> _MethodSignatureCopier[P]:
+    """
+    Use the signature and doc of ``tp`` for the decorated method ``cb``.
+    
+    Returns
+    -------
+    A decorator that copies the doc and static typing signature from ``tp`` to ``cb``.
+    """
+    
+    def decorate(cb: WrapsMethod[T, R], /) -> WrappedMethod[T, P, R]:
+        # 核心：调用 _wrap_and_copy_doc 复制文档和设置 __wrapped__
+        _wrap_and_copy_doc(tp, cb)
+        return cb
+    
+    return decorate
+```
+
+#### `use_signature_func` 装饰器（用于普通函数）
+
+```python
+def use_signature_func(tp: Callable[P, Any], /) -> _FunctionSignatureCopier[P]:
+    """
+    Use the signature and doc of ``tp`` for the decorated function ``cb``.
+    
+    Returns
+    -------
+    A decorator that copies the doc and static typing signature from ``tp`` to ``cb``.
+    """
+    
+    def decorate(fn: Callable[..., R], /) -> Callable[P, R]:
+        _wrap_and_copy_doc(tp, fn)
+        return fn
+    
+    return decorate
+```
+
+#### `_wrap_and_copy_doc` 核心辅助函数
+
+**文件位置**: `altair/utils/core.py:736-752`
+
+```python
+def _wrap_and_copy_doc(tp: Callable[..., Any], cb: Callable[..., Any]) -> None:
+    """
+    复制文档字符串，设置 __wrapped__ 属性。
+    
+    Notes
+    -----
+    - Reference to ``tp`` is stored in ``cb.__wrapped__``.
+    - The doc for ``cb`` will have a ``.rst`` link added, referring  to ``tp``.
+    """
+    
+    # 步骤1：设置 __wrapped__ 属性
+    # 对于类，使用 __init__；对于函数，使用自身
+    cb.__wrapped__ = getattr(tp, "__init__", tp)
+    
+    # 步骤2：复制和处理文档字符串
+    if doc_in := tp.__doc__:
+        # cb 原有文档的第一行（或默认引用提示）
+        line_1 = f"{cb.__doc__ or f'Refer to :class:`{tp.__name__}`'}\n"
+        
+        # 合并文档：
+        # - 第一行使用 cb 原有的（或默认）
+        # - 后续行使用 tp.__doc__ 的内容
+        cb.__doc__ = "".join((line_1, *doc_in.splitlines(keepends=True)[1:]))
+    else:
+        msg = f"Found no doc for {tp!r}"
+        raise AttributeError(msg)
+```
+
+### 18.4 类型系统的魔法：`ParamSpec` 和 `WrapsMethod`
+
+**关键类型定义**（`altair/utils/core.py`）：
+
+```python
+# ParamSpec 用于捕获目标类型的签名
+P = ParamSpec("P")
+T = TypeVar("T")  # self 类型
+R = TypeVar("R")  # 返回值类型
+
+# WrapsMethod：装饰前的方法类型（签名是通用的）
+WrapsMethod = Callable[Concatenate[T, ...], R]
+
+# WrappedMethod：装饰后的方法类型（签名是 P，即 tp 的签名）
+WrappedMethod = Callable[Concatenate[T, P], R]
+```
+
+**类型系统如何工作**：
+
+```python
+# 假设 MarkDef.__init__ 的签名是：
+# def __init__(
+#     self,
+#     color: Optional[str] = Undefined,
+#     filled: Optional[bool] = Undefined,
+#     **kwargs: Any
+# ) -> None: ...
+
+# @use_signature(MarkDef) 时：
+# - P = (color: Optional[str] = Undefined, filled: Optional[bool] = Undefined, **kwargs: Any)
+# - T = Self (方法的 self 类型)
+# - R = Self (返回值类型)
+
+# 装饰前：
+def mark_point(self, **kwds: Any) -> Self: ...
+# 类型：Callable[Concatenate[Self, ...], Self]
+
+# 装饰后：
+@use_signature(MarkDef)
+def mark_point(self, **kwds: Any) -> Self: ...
+# 类型：Callable[Concatenate[Self, P], Self]
+# 其中 P = MarkDef.__init__ 的参数签名
+
+# 结果：IDE 看到的签名是：
+# def mark_point(
+#     self,
+#     color: Optional[str] = Undefined,
+#     filled: Optional[bool] = Undefined,
+#     **kwargs: Any
+# ) -> Self: ...
+```
+
+### 18.5 代码生成阶段的配合：虚拟 `_MarkDef` 类
+
+在 `mixins.py` 中，`@use_signature` 需要一个"签名来源"类。但 `core.MarkDef` 是在 `core.py` 中定义的，如果直接使用它，会导致类型检查器看到两个不同的类。
+
+**解决方案**：在 `mixins.py` 中生成一个虚拟的 `_MarkDef` 类，与 `core.MarkDef` 有相同的签名。
+
+**生成逻辑** (`tools/generate_schema_wrapper.py:2066-2093`)：
+
+```python
+def generate_vegalite_mark_mixin(fp: Path, /, markdefs: dict[str, str]) -> str:
+    schema = load_schema(fp)
+    code: list[str] = []
+
+    # 步骤1：生成虚拟的 _MarkDef 类（用于 @use_signature）
+    # 排除 'type' 属性，因为 mark_xxx() 方法会自动设置 type
+    it_dummy = (
+        SchemaGenerator(
+            classname=f"_{mark_def}",  # 如 "_MarkDef"
+            schema={"$ref": "#/definitions/" + mark_def},
+            rootschema=schema,
+            exclude_properties={"type"},  # 关键：排除 type 参数
+            annotate_kwds_flag=True,
+        ).schema_class()
+        for mark_def in markdefs.values()
+    )
+
+    # 步骤2：为每个 mark 类型生成方法
+    for mark_enum, mark_def in markdefs.items():
+        _def = schema["definitions"][mark_enum]
+        marks: list[Any] = _def["enum"] if "enum" in _def else [_def["const"]]
+
+        for mark in marks:
+            # mark = "point", "bar", "line" 等
+            mark_method = MARK_METHOD.format(
+                decorator=f"_{mark_def}",    # 如 "_MarkDef"
+                mark=mark,
+                mark_def=mark_def
+            )
+            code.append("\n    ".join(mark_method.splitlines()))
+```
+
+**生成的虚拟类** (`mixins.py`)：
+
+```python
+# 虚拟类，与 core.MarkDef 签名相同（但排除了 'type'）
+class _MarkDef:
+    """_MarkDef schema wrapper..."""
+    _schema = {'$ref': '#/definitions/MarkDef'}
+    
+    def __init__(
+        self,
+        aria: Optional[bool] = Undefined,
+        color: Optional[str] = Undefined,
+        filled: Optional[bool] = Undefined,
+        # ... 其他参数，但没有 'type'（因为被 exclude_properties 排除）
+        **kwds: Any
+    ):
+        super(_MarkDef, self).__init__(...)
+```
+
+**生成的方法** (`mixins.py`)：
+
+```python
+class MarkMethodMixin:
+    """A mixin class that defines mark methods"""
+
+    @use_signature(_MarkDef)
+    def mark_point(self, **kwds: Any) -> Self:
+        """Set the chart's mark to 'point' (see :class:`MarkDef`)."""
+        copy = self.copy(deep=False)
+        if any(val is not Undefined for val in kwds.values()):
+            # 注意：自动设置 type="point"
+            copy.mark = core.MarkDef(type="point", **kwds)
+        else:
+            copy.mark = "point"
+        return copy
+
+    @use_signature(_MarkDef)
+    def mark_bar(self, **kwds: Any) -> Self:
+        """Set the chart's mark to 'bar'..."""
+        copy = self.copy(deep=False)
+        if any(val is not Undefined for val in kwds.values()):
+            copy.mark = core.MarkDef(type="bar", **kwds)
+        else:
+            copy.mark = "bar"
+        return copy
+    
+    # mark_line, mark_area, etc.
+```
+
+### 18.6 `api.py` 中的使用场景
+
+#### 场景1：子类化 `SchemaBase` 派生类
+
+**文件位置**: `altair/vegalite/v6/api.py:312-322`
+
+```python
+class LookupData(core.LookupData):
+    @utils.use_signature(core.LookupData)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+    
+    # 自定义的 to_dict 方法（处理 data 转换）
+    def to_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Convert the chart to a dictionary suitable for JSON export."""
+        copy = self.copy(deep=False)
+        copy.data = _prepare_data(copy.data, kwargs.get("context"))
+        return super(LookupData, copy).to_dict(*args, **kwargs)
+```
+
+**设计意图**：
+- `LookupData` 需要在 `to_dict()` 中做特殊处理（`_prepare_data`）
+- 使用 `@use_signature` 确保 `__init__` 的签名与 `core.LookupData` 完全一致
+
+#### 场景2：便利函数 `binding_*`
+
+**文件位置**: `altair/vegalite/v6/api.py:1907-1933`
+
+```python
+@utils.use_signature_func(core.BindCheckbox)
+def binding_checkbox(**kwargs: Any) -> BindCheckbox:
+    """A checkbox binding."""
+    return core.BindCheckbox(input="checkbox", **kwargs)
+
+
+@utils.use_signature_func(core.BindRadioSelect)
+def binding_radio(**kwargs: Any) -> BindRadioSelect:
+    """A radio button binding."""
+    return core.BindRadioSelect(input="radio", **kwargs)
+
+
+@utils.use_signature_func(core.BindRadioSelect)
+def binding_select(**kwargs: Any) -> BindRadioSelect:
+    """A select binding."""
+    return core.BindRadioSelect(input="select", **kwargs)
+
+
+@utils.use_signature_func(core.BindRange)
+def binding_range(**kwargs: Any) -> BindRange:
+    """A range binding."""
+    return core.BindRange(input="range", **kwargs)
+```
+
+**设计意图**：
+- `binding_checkbox()` 是 `core.BindCheckbox(input="checkbox", ...)` 的简写
+- 使用 `@use_signature_func` 复制 `BindCheckbox.__init__` 的签名
+- 用户不需要记住 `input="checkbox"` 这个固定参数
+
+### 18.7 `configure_*` 方法的设计
+
+**文件位置**: `mixins.py` 中的 `ConfigMethodMixin`
+
+```python
+class ConfigMethodMixin:
+    """A mixin class that defines config methods"""
+
+    @use_signature(core.Config)
+    def configure(self, *args, **kwargs) -> Self:
+        copy = self.copy(deep=False)
+        copy.config = core.Config(*args, **kwargs)
+        return copy
+
+    @use_signature(core.AxisConfig)
+    def configure_axis(self, *args, **kwargs) -> Self:
+        copy = self.copy(deep=['config'])
+        if copy.config is Undefined:
+            copy.config = core.Config()
+        # 关键：直接设置 config["axis"]
+        copy.config["axis"] = core.AxisConfig(*args, **kwargs)
+        return copy
+
+    @use_signature(core.MarkConfig)
+    def configure_mark(self, *args, **kwargs) -> Self:
+        copy = self.copy(deep=['config'])
+        if copy.config is Undefined:
+            copy.config = core.Config()
+        copy.config["mark"] = core.MarkConfig(*args, **kwargs)
+        return copy
+
+    # configure_legend, configure_title, configure_view, etc.
+```
+
+**设计要点**：
+- `configure()` 直接设置整个 `config` 对象
+- `configure_axis()`、`configure_mark()` 等方法设置 `config` 的特定属性
+- 使用 `copy(deep=['config'])` 确保 `config` 对象被深拷贝
+- 使用 `config["axis"]` 而非 `config.axis` 避免触发 Undefined 检查
+
+### 18.8 为什么不直接生成带签名的方法？
+
+**可能的疑问**：既然代码生成器可以生成 `core.py`、`channels.py`，为什么不直接在 `mixins.py` 中生成带完整签名的方法？
+
+**回答**：这是一个**关注点分离**的设计决策：
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **直接生成签名** | 运行时无需装饰器 | 代码生成器更复杂，需要处理模板变量、方法体等 |
+| **`@use_signature` + 运行时装饰** | 代码生成器只需处理模板字符串，方法体手写 | 运行时需要装饰器，依赖 `ParamSpec` 类型系统 |
+
+**Altair 选择后者的原因**：
+
+1. **方法体逻辑复杂**：`mark_point()`、`configure_axis()` 等方法的逻辑相对复杂，包含条件判断、`copy(deep=...)` 等操作。用模板字符串生成这些逻辑会非常繁琐且难以维护。
+
+2. **签名来自现有类**：`MarkDef`、`AxisConfig` 等类已经在 `core.py` 中生成好了，签名信息已经存在。通过 `@use_signature` 可以**复用**这些信息，避免重复。
+
+3. **类型检查器支持**：现代 Python 类型检查器（mypy、pyright）都支持 `ParamSpec` 和 `@use_signature` 这种模式。IDE 自动补全和类型检查可以正常工作。
+
+4. **文档自动同步**：通过 `__wrapped__` 属性，文档字符串可以自动继承和更新，避免手动维护的不一致问题。
+
+### 18.9 `@use_signature` 完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ 阶段1：代码生成（生成 mixins.py）                                      │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 1. 生成虚拟类 _MarkDef                                                │
+│    - 基于 core.MarkDef 的 schema                                      │
+│    - 使用 exclude_properties={"type"} 排除 type 参数                   │
+│    - 生成与 core.MarkDef 相同的签名（但无 type）                       │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 2. 生成 mark_* 方法                                                   │
+│    - 使用模板 MARK_METHOD                                              │
+│    - @use_signature(_MarkDef)                                          │
+│    - 方法体：**kwds 传递 + type="point" 自动设置                       │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ 运行时（导入 mixins.py）
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 阶段2：运行时装饰（@use_signature 执行）                              │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 3. use_signature(_MarkDef) 返回 decorate 函数                         │
+│    - P = ParamSpec 捕获 _MarkDef.__init__ 的签名                       │
+│    - 返回 Callable[Concatenate[T, P], R] 类型                         │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 4. decorate(mark_point) 调用                                          │
+│    - 设置 mark_point.__wrapped__ = _MarkDef.__init__                  │
+│    - 复制和处理文档字符串                                               │
+│    - 返回 mark_point（签名现在是 P）                                   │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ 用户调用
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 阶段3：用户使用                                                        │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 5. 用户调用 chart.mark_point(color="red", filled=True)                │
+│    - IDE 看到完整签名：color, filled, aria, stroke, 等                │
+│    - 自动补全、类型检查正常工作                                         │
+│    - 方法体执行：**kwds = {"color": "red", "filled": True}            │
+│    - core.MarkDef(type="point", **kwds)                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 19. `CORE_OVERRIDES` 覆盖体系
+
+### 19.1 概述
+
+`CORE_OVERRIDES` 是一个覆盖机制，允许对特定的 schema definition 使用不同的代码生成器。默认情况下，所有 definition 都使用 `SchemaGenerator` 生成代码，但某些特殊的 schema 模式需要自定义生成器。
+
+**核心定义** (`tools/generate_schema_wrapper.py:482-491`)：
+
+```python
+SchGen = TypeVar("SchGen", bound=SchemaGenerator)
+
+class OverridesItem(TypedDict, Generic[SchGen]):
+    tp: type[SchGen]      # 要使用的生成器类
+    kwds: dict[str, Any]   # 传递给生成器的额外参数
+
+
+CORE_OVERRIDES: dict[str, OverridesItem[SchemaGenerator]] = {
+    "PredicateComposition": OverridesItem(
+        tp=MethodSchemaGenerator, 
+        kwds={"method_code": DUNDER_PREDICATE_COMPOSITION}
+    )
+}
+```
+
+### 19.2 默认生成器：`SchemaGenerator`
+
+**文件位置**: `tools/generate_schema_wrapper.py:451-460`
+
+```python
+class SchemaGenerator(codegen.SchemaGenerator):
+    schema_class_template = textwrap.dedent(
+        '''
+    class {classname}({basename}):
+        """{docstring}"""
+        _schema = {schema!r}
+
+        {init_code}
+    '''
+    )
+```
+
+**生成的代码结构**：
+
+```python
+class FieldDef(VegaLiteSchema):
+    """FieldDef schema wrapper..."""
+    _schema = {'$ref': '#/definitions/FieldDef'}
+    
+    def __init__(self, field: Optional[str] = Undefined, type=...):
+        super(FieldDef, self).__init__(field=field, type=type, ...)
+```
+
+**包含内容**：
+- 类定义
+- docstring
+- `_schema` 类属性
+- `__init__` 方法
+
+### 19.3 扩展生成器：`MethodSchemaGenerator`
+
+**文件位置**: `tools/generate_schema_wrapper.py:463-476`
+
+```python
+class MethodSchemaGenerator(SchemaGenerator):
+    """Base template w/ an extra slot `{method_code}` after `{init_code}`."""
+
+    schema_class_template = textwrap.dedent(
+        '''
+    class {classname}({basename}):
+        """{docstring}"""
+        _schema = {schema!r}
+
+        {init_code}
+
+        {method_code}    # 额外的方法代码插槽
+    '''
+    )
+```
+
+**与默认生成器的区别**：
+
+| 特性 | `SchemaGenerator` | `MethodSchemaGenerator` |
+|------|------------------|------------------------|
+| 模板插槽 | `{init_code}` 后直接结束 | 额外的 `{method_code}` 插槽 |
+| 生成代码 | 只有 `__init__` | `__init__` + 自定义方法 |
+| 适用场景 | 大多数 definition | 需要额外方法的特殊类 |
+
