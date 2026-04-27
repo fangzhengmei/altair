@@ -1678,6 +1678,470 @@ context = {
 
 ---
 
+#### 3.4.4 多层图表的递归 context 传递机制
+
+这是数据去重共享的**根本原因**。多层图表（`layer`、`concat`、`hconcat`、`vconcat`）中的子图共享同一个 `context` 字典引用，实现了数据的自动去重。
+
+##### 核心代码分析：TopLevelMixin.to_dict
+
+**`TopLevelMixin.to_dict` 方法**（`altair/vegalite/v6/api.py:2044-2157`）：
+
+```python
+def to_dict(
+    self,
+    validate: bool = True,
+    *,
+    format: Literal["vega-lite", "vega"] = "vega-lite",
+    ignore: list[str] | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # 注意：不是深拷贝！我们希望 datasets 和 data 按引用传递
+    context = context.copy() if context else {}  # 浅拷贝！
+    context.setdefault("datasets", {})           # 初始化 datasets
+    is_top_level = context.get("top_level", True)
+
+    # ... 数据准备处理 ...
+
+    # ⚠️ 关键：进入子图前将 top_level 设为 False
+    context["top_level"] = False
+
+    # 调用父类的 to_dict，会递归遍历所有子 SchemaBase 对象
+    # 并传递同一个 context 引用（注意：传递的是 dict(context, pre_transform=False)）
+    vegalite_spec: Any = _top_schema_base(super(TopLevelMixin, copy)).to_dict(
+        validate=validate, ignore=ignore, context=dict(context, pre_transform=False)
+    )
+
+    # 只有顶层才添加 $schema 和主题
+    if is_top_level:
+        # 添加 $schema
+        if "$schema" not in vegalite_spec:
+            vegalite_spec["$schema"] = SCHEMA_URL
+        
+        # 合并主题（见 3.4.5 节）
+        if func := theme.get():
+            vegalite_spec = utils.update_nested(func(), vegalite_spec, copy=True)
+        else:
+            # ⚠️ 不是静默跳过！get() 返回 None 时抛出 TypeError
+            msg = (
+                f"Expected a theme to be set but got {None!r}.\n"
+                f"Call `themes.enable('default')` to reset the `ThemeRegistry`."
+            )
+            raise TypeError(msg)
+        
+        # 只有顶层才合并 datasets
+        if context["datasets"]:
+            vegalite_spec.setdefault("datasets", {}).update(context["datasets"])
+
+    # ... 后续处理 ...
+    return vegalite_spec
+```
+
+##### 关键发现：浅拷贝与引用共享
+
+```python
+# 这里是浅拷贝！
+context = context.copy() if context else {}
+```
+
+**浅拷贝的含义：**
+- 字典本身被复制（新的 dict 对象）
+- 但字典中的**可变对象（如嵌套字典、列表）仍按引用传递**
+- `context["datasets"]` 是一个嵌套字典，**所有子图共享同一个引用**
+
+##### 多层图表的递归传递示例
+
+以 `LayerChart` 为例：
+
+```python
+import altair as alt
+
+# 两个子图使用相同的数据
+chart1 = alt.Chart(df).mark_point().encode(x="x", y="y")
+chart2 = alt.Chart(df).mark_line().encode(x="x", y="y")
+
+layered = alt.layer(chart1, chart2)
+layered.to_dict()
+```
+
+**执行流程：**
+
+```
+用户调用 layered.to_dict()
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 第一层：LayerChart (顶层)                                         │
+│   - context = {"datasets": {}, "top_level": True}               │
+│   - 处理数据：_prepare_data(..., context)                        │
+│   - context["top_level"] = False                                 │
+│   - 调用 SchemaBase.to_dict(context=...)                         │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ SchemaBase.to_dict() 递归遍历子对象                               │
+│   - LayerChart 的 layer 属性包含 [chart1, chart2]               │
+│   - 对每个子图调用子图.to_dict(context=context)                  │
+│   - ⚠️ 所有子图共享同一个 context 引用！                          │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ├───▶ 子图 chart1.to_dict(context)
+         │         │
+         │         ▼
+         │    _prepare_data(df, context)
+         │         │
+         │         ▼
+         │    _consolidate_data(data, context)
+         │         │
+         │         ├── 计算数据内容的 hash：data-abc123
+         │         ├── context["datasets"]["data-abc123"] = values
+         │         └── 返回 NamedData(name="data-abc123")
+         │
+         ├───▶ 子图 chart2.to_dict(context)
+         │         │
+         │         ▼
+         │    _prepare_data(df, context)
+         │         │
+         │         ▼
+         │    _consolidate_data(data, context)
+         │         │
+         │         ├── 计算相同的 hash：data-abc123
+         │         ├── 检查 context["datasets"]["data-abc123"] 已存在
+         │         └── 直接返回 NamedData(name="data-abc123")
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 回到顶层：is_top_level = True                                    │
+│   - 添加 $schema                                                  │
+│   - 合并主题                                                      │
+│   - 合并 context["datasets"] 到 spec["datasets"]                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+##### 最终输出
+
+```python
+{
+    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+    "config": {
+        "view": {"continuousWidth": 300, "continuousHeight": 300}
+    },
+    "layer": [
+        {
+            "data": {"name": "data-abc123"},  # 引用顶层 datasets
+            "mark": "point",
+            "encoding": {...}
+        },
+        {
+            "data": {"name": "data-abc123"},  # 相同的引用！
+            "mark": "line",
+            "encoding": {...}
+        }
+    ],
+    "datasets": {
+        "data-abc123": [{"x": 1, "y": 2}, {"x": 3, "y": 4}, ...]  # 只存储一份！
+    }
+}
+```
+
+##### top_level 标记的作用
+
+| 标记值 | 行为 |
+|-------|------|
+| `True` (顶层) | 添加 `$schema`、合并主题、合并 `context["datasets"]` |
+| `False` (子图) | 跳过上述操作，数据以 `NamedData` 引用形式存在 |
+
+**为什么需要这个标记：**
+
+1. **`$schema` 唯一性**：Vega-Lite spec 只允许顶层有 `$schema`
+2. **主题合并**：主题是全局配置，只需要应用一次
+3. **`datasets` 位置**：所有命名数据必须放在顶层 `datasets` 中，子图只能引用
+
+---
+
+#### 3.4.5 主题注册表：第三个 PluginRegistry 参与者
+
+图表输出流程中，主题注册表是第三个参与者，同样使用 `PluginRegistry` 模式。
+
+##### ThemeRegistry 定义
+
+**`ThemeRegistry` 类**（`altair/vegalite/v6/theme.py:29-78`）：
+
+```python
+class ThemeRegistry(PluginRegistry[Plugin[ThemeConfig], ThemeConfig]):
+    def enable(
+        self,
+        name: LiteralString | AltairThemes | VegaThemes | None = None,
+        **options: Any,
+    ) -> PluginEnabler[Plugin[ThemeConfig], ThemeConfig]:
+        """
+        Enable a theme by name.
+        """
+        return super().enable(name, **options)
+
+    def get(self) -> partial[ThemeConfig] | Plugin[ThemeConfig] | None:
+        """Return the currently active theme."""
+        return super().get()
+```
+
+**已注册的主题**（`altair/vegalite/v6/theme.py:104-122`）：
+
+```python
+# 内置主题
+themes.register(
+    "default",
+    lambda: {"config": {"view": {"continuousWidth": 300, "continuousHeight": 300}}},
+)
+themes.register(
+    "opaque",
+    lambda: {
+        "config": {
+            "background": "white",
+            "view": {"continuousWidth": 300, "continuousHeight": 300},
+        }
+    },
+)
+themes.register("none", ThemeConfig)  # 空主题
+
+# Vega 主题（如 "dark", "fivethirtyeight" 等）
+for theme in VEGA_THEMES:
+    themes.register(theme, VegaTheme(theme))
+
+themes.enable("default")  # 默认启用 default 主题
+```
+
+##### 主题合并机制：update_nested
+
+**`to_dict` 中的主题合并代码**（`altair/vegalite/v6/api.py:2124-2131`）：
+
+```python
+if is_top_level:
+    # ...
+    
+    if func := theme.get():
+        # ⚠️ 注意顺序：func() 是主题默认值，vegalite_spec 是用户 spec
+        # update_nested(original, update) → update 覆盖 original
+        vegalite_spec = utils.update_nested(func(), vegalite_spec, copy=True)
+    else:
+        # ⚠️ 不是静默跳过！get() 返回 None 时抛出 TypeError
+        msg = (
+            f"Expected a theme to be set but got {None!r}.\n"
+            f"Call `themes.enable('default')` to reset the `ThemeRegistry`."
+        )
+        raise TypeError(msg)
+```
+
+**`update_nested` 函数实现**（`altair/utils/core.py:807-849`）：
+
+```python
+def update_nested(
+    original: Any,
+    update: Mapping[Any, Any],
+    copy: bool = False,
+) -> MutableMapping[Any, Any]:
+    """
+    Update nested dictionaries.
+    
+    Parameters
+    ----------
+    original : MutableMapping
+        the original (nested) dictionary, which will be updated in-place
+    update : Mapping
+        the nested dictionary of updates
+    copy : bool, default False
+        if True, then copy the original dictionary rather than modifying it
+    """
+    if copy:
+        original = deepcopy(original)  # 深拷贝，不修改原对象
+    
+    for key, val in update.items():
+        if isinstance(val, Mapping):
+            # 如果值是字典，递归合并
+            orig_val = original.get(key, {})
+            if isinstance(orig_val, MutableMapping):
+                original[key] = update_nested(orig_val, val)
+            else:
+                original[key] = val
+        else:
+            # 否则直接覆盖
+            original[key] = val
+    
+    return original
+```
+
+##### 合并顺序：主题默认值被用户 spec 覆盖
+
+**调用方式：**
+```python
+update_nested(func(), vegalite_spec, copy=True)
+#              ↑                ↑
+#           original          update
+```
+
+**合并规则：**
+- `original` = 主题配置（默认值）
+- `update` = 用户 spec（用户显式设置）
+- `update` 中的值覆盖 `original` 中的值
+
+**示例：**
+
+```python
+# 主题默认值
+theme_config = {
+    "config": {
+        "view": {
+            "continuousWidth": 300,
+            "continuousHeight": 300
+        },
+        "mark": {
+            "color": "blue"
+        }
+    }
+}
+
+# 用户 spec
+user_spec = {
+    "config": {
+        "mark": {
+            "color": "red"  # 用户显式设置
+        }
+    },
+    "mark": "point",
+    "encoding": {...}
+}
+
+# 合并结果
+result = update_nested(theme_config, user_spec, copy=True)
+# 输出:
+# {
+#     "config": {
+#         "view": {
+#             "continuousWidth": 300,   # 来自主题
+#             "continuousHeight": 300  # 来自主题
+#         },
+#         "mark": {
+#             "color": "red"           # 用户覆盖了主题的 "blue"
+#         }
+#     },
+#     "mark": "point",
+#     "encoding": {...}
+# }
+```
+
+##### 为什么 get() 返回 None 时抛出 TypeError？
+
+**`PluginRegistry.get()` 方法**（`altair/utils/plugin_registry.py:262-276`）：
+
+```python
+def get(self) -> partial[R] | Plugin[R] | None:
+    """Return the currently active plugin."""
+    if (func := self._active) and self.plugin_type(func):
+        return partial(func, **self._options) if self._options else func
+    elif self._active is not None:
+        raise TypeError(...)
+    elif TYPE_CHECKING:
+        raise NotImplementedError
+```
+
+**返回 `None` 的情况：**
+- `self._active` 是 `None`（没有激活任何插件）
+
+**为什么 `to_dict` 不接受 `None`：**
+
+```python
+if func := theme.get():
+    vegalite_spec = utils.update_nested(func(), vegalite_spec, copy=True)
+else:
+    msg = (
+        f"Expected a theme to be set but got {None!r}.\n"
+        f"Call `themes.enable('default')` to reset the `ThemeRegistry`."
+    )
+    raise TypeError(msg)
+```
+
+**设计意图：**
+- 主题是必需的，影响图表的视觉呈现
+- 不是静默失败，而是显式报错，引导用户修复
+- 用户可以调用 `themes.enable('default')` 或 `themes.enable('none')`
+
+**`'none'` 主题的特殊之处：**
+
+```python
+themes.register("none", ThemeConfig)
+```
+
+`ThemeConfig` 是什么？让我们查看它的定义（`altair/vegalite/v6/schema/_config.py`）：
+
+```python
+# ThemeConfig 是一个 TypedDict 或类似的类型定义
+# 作为主题时，调用它返回空字典 {}
+
+# 所以：
+# themes.enable('none')
+# theme.get() 返回 ThemeConfig
+# func() = ThemeConfig() = {}
+# update_nested({}, user_spec) = user_spec
+```
+
+`'none'` 主题实际上是一个"空主题"，调用后返回空字典，不覆盖任何用户配置。
+
+##### 三个注册表的对比
+
+| 特性 | 数据转换器 | 渲染器 | 主题 |
+|-----|-----------|--------|------|
+| 注册表类 | `DataTransformerRegistry` | `RendererRegistry` | `ThemeRegistry` |
+| 基类 | `PluginRegistry` | `PluginRegistry` | `PluginRegistry` |
+| 入口点组 | `altair.vegalite.v6.data_transformer` | `altair.vegalite.v6.renderer` | `altair.vegalite.v6.theme` |
+| `get()` 返回 `None` 行为 | ⚠️ 可能静默跳过 | ⚠️ 可能静默跳过 | ❌ **抛出 TypeError** |
+| 调用时机 | `_prepare_data()` 中 | `_repr_mimebundle_()` 中 | `to_dict()` 顶层处理中 |
+
+##### 完整的图表输出流程（含主题合并）
+
+```
+用户调用 chart.to_dict()
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 阶段 1：数据准备（数据适配层）                                    │
+│   - context = {"datasets": {}, "top_level": True}               │
+│   - _prepare_data(data, context)                                 │
+│   - 调用 data_transformers.get() → 数据转换器                   │
+│   - _consolidate_data(data, context) → 合并到 datasets          │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 阶段 2：递归序列化（schemapi 层）                                │
+│   - context["top_level"] = False                                 │
+│   - SchemaBase.to_dict(context=context)                         │
+│   - 递归遍历所有子图，共享同一个 context["datasets"] 引用       │
+│   - 子图数据以 NamedData 引用形式存储                            │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 阶段 3：顶层处理（主题注册表参与）                                │
+│   - is_top_level = True                                          │
+│   - 添加 $schema                                                 │
+│   - ⚠️ 调用 theme.get()                                          │
+│     - 如果返回 None → 抛出 TypeError                             │
+│     - 如果返回函数 → func() 获取主题配置                         │
+│   - ⚠️ update_nested(主题配置, 用户 spec)                        │
+│     - 用户 spec 覆盖主题默认值                                   │
+│   - 合并 context["datasets"] 到 spec["datasets"]                │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 阶段 4：渲染输出（渲染后端层）                                    │
+│   - _repr_mimebundle_() 被调用                                   │
+│   - 调用 renderers.get() → 渲染器                                │
+│   - 返回 MIME bundle                                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## 四、扩展机制与架构设计
 
 ### 4.1 PluginRegistry 通用设计
