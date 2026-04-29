@@ -126,6 +126,214 @@ def is_chart_type(obj: Any) -> TypeIs[ChartType]:
 - 这些编码会被从各层中剥离并提升到顶层
 - 返回 `FacetChart` 而非 `LayerChart`
 
+### 2.3.3 原地赋值运算符（`+=`、`&=`、`|=`）的实现与行为
+
+**关键发现**：Altair 提供了原地赋值形式的运算符重载，但实现模式与非原地形式有重要差异。
+
+#### 2.3.3.1 原地与非原地运算符的对应关系
+
+| 复合类型 | 非原地运算符 | 原地运算符 | 对应复合图表类 |
+|----------|--------------|------------|----------------|
+| 分层 | `+` (`__add__`) | `+=` (`__iadd__`) | `LayerChart` |
+| 垂直拼接 | `&` (`__and__`) | `&=` (`__iand__`) | `VConcatChart` |
+| 水平拼接 | `|` (`__or__`) | `|=` (`__ior__`) | `HConcatChart` |
+
+#### 2.3.3.2 原地赋值运算符的实现
+
+**分层 (`+=`)**（`api.py:4860-4866`）：
+
+```python
+# LayerChart.__iadd__
+def __iadd__(self, other: ChartType) -> Self:
+    _check_if_valid_subspec(other, "LayerChart")
+    _check_if_can_be_layered(other)
+    self.layer.append(other)  # 直接修改 self.layer
+    self.data, self.layer = _combine_subchart_data(self.data, self.layer)
+    self.params, self.layer = _combine_subchart_params(self.params, self.layer)
+    return self  # 返回 self
+```
+
+**非原地分层 (`+`)**（`api.py:4868-4871`）：
+
+```python
+# LayerChart.__add__
+def __add__(self, other: ChartType) -> Self:
+    copy = self.copy(deep=["layer"])  # 先创建副本
+    copy += other  # 调用原地运算符
+    return copy  # 返回副本
+```
+
+**垂直拼接 (`&=`)**（`api.py:4716-4721`）：
+
+```python
+# VConcatChart.__iand__
+def __iand__(self, other: ChartType) -> Self:
+    _check_if_valid_subspec(other, "VConcatChart")
+    self.vconcat.append(other)
+    self.data, self.vconcat = _combine_subchart_data(self.data, self.vconcat)
+    self.params, self.vconcat = _combine_subchart_params(self.params, self.vconcat)
+    return self
+```
+
+**非原地垂直拼接 (`&`)**（`api.py:4723-4726`）：
+
+```python
+# VConcatChart.__and__
+def __and__(self, other: ChartType) -> Self:
+    copy = self.copy(deep=["vconcat"])
+    copy &= other
+    return copy
+```
+
+**水平拼接 (`|=`)**（`api.py:4612-4617`）：
+
+```python
+# HConcatChart.__ior__
+def __ior__(self, other: ChartType) -> Self:
+    _check_if_valid_subspec(other, "HConcatChart")
+    self.hconcat.append(other)
+    self.data, self.hconcat = _combine_subchart_data(self.data, self.hconcat)
+    self.params, self.hconcat = _combine_subchart_params(self.params, self.hconcat)
+    return self
+```
+
+**非原地水平拼接 (`|`)**（`api.py:4619-4622`）：
+
+```python
+# HConcatChart.__or__
+def __or__(self, other: ChartType) -> Self:
+    copy = self.copy(deep=["hconcat"])
+    copy |= other
+    return copy
+```
+
+#### 2.3.3.3 原地与非原地形式的行为差异
+
+| 特性 | 原地形式 (`+=`/`&=`/`|=`) | 非原地形式 (`+`/`&`/`|`) |
+|------|---------------------------|---------------------------|
+| 是否修改原对象 | ✅ 是 | ❌ 否 |
+| 是否创建副本 | ❌ 否 | ✅ 是（先 `copy()`） |
+| 返回值 | `self`（原对象） | 新对象 |
+| 数据合并逻辑 | 相同（`_combine_subchart_data`） | 相同 |
+| 参数合并逻辑 | 相同（`_combine_subchart_params`） | 相同 |
+
+#### 2.3.3.4 实际使用场景对比
+
+**场景 1：使用非原地形式（推荐用于链式调用）**
+
+```python
+import altair as alt
+import pandas as pd
+
+data = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
+
+base = alt.Chart(data).encode(x="x")
+points = base.mark_point().encode(y="y")
+lines = base.mark_line().encode(y="mean(y)")
+
+# 非原地形式：原对象不变
+combined = points + lines
+# points 和 lines 保持不变
+# combined 是新的 LayerChart 对象
+
+# 链式调用更安全
+final = (points + lines).properties(title="Layered Chart")
+```
+
+**场景 2：使用原地形式（适用于渐进式构建）**
+
+```python
+import altair as alt
+import pandas as pd
+
+data = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
+
+base = alt.Chart(data).encode(x="x")
+points = base.mark_point().encode(y="y")
+lines = base.mark_line().encode(y="mean(y)")
+
+# 先创建一个分层图表
+layered = points + lines
+
+# 原地添加更多层（修改 layered 本身）
+layered += base.mark_rule().encode(y="median(y)")
+
+# layered 现在包含 3 层
+# 注意：原 points 和 lines 对象不受影响（因为 + 已创建副本）
+```
+
+**场景 3：测试用例中的实际用法**（`test_api.py:347-376`）：
+
+```python
+def test_chart_operations():
+    data = pd.DataFrame(...)
+    chart1 = alt.Chart(data).mark_line().encode(x="x", y="y", color="c")
+    chart2 = chart1.mark_point()
+    chart3 = chart1.mark_circle()
+    chart4 = chart1.mark_square()
+
+    # 非原地链式调用
+    chart = chart1 + chart2 + chart3
+    assert isinstance(chart, alt.LayerChart)
+    assert len(chart.layer) == 3
+
+    # 原地添加
+    chart += chart4
+    assert len(chart.layer) == 4
+
+    # 水平拼接
+    chart = chart1 | chart2 | chart3
+    chart |= chart4  # 原地
+    assert len(chart.hconcat) == 4
+
+    # 垂直拼接
+    chart = chart1 & chart2 & chart3
+    chart &= chart4  # 原地
+    assert len(chart.vconcat) == 4
+```
+
+#### 2.3.3.5 深拷贝的行为
+
+**关键注意点**：非原地运算符使用 `self.copy(deep=["layer"])` 进行深拷贝。
+
+```python
+# LayerChart.__add__ 中的深拷贝
+copy = self.copy(deep=["layer"])
+```
+
+**深拷贝的影响**：
+- `layer`、`hconcat`、`vconcat` 列表中的元素会被深拷贝
+- 对副本的修改不会影响原对象
+- 这确保了非原地运算符的纯粹性（无副作用）
+
+**潜在陷阱**：
+
+```python
+import altair as alt
+import pandas as pd
+
+data = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
+
+chart1 = alt.Chart(data).mark_point().encode(x="x", y="y")
+chart2 = alt.Chart(data).mark_line().encode(x="x", y="mean(y)")
+
+# 非原地形式
+combined1 = chart1 + chart2
+# combined1.layer[0] 是 chart1 的深拷贝
+# combined1.layer[1] 是 chart2 的深拷贝
+
+# 如果修改 combined1，不会影响 chart1 和 chart2
+combined1.layer[0].encoding.color = "red:N"
+# chart1 的 encoding 保持不变
+
+# 原地形式
+combined2 = chart1 + chart2  # 先创建副本
+original_id = id(combined2)
+combined2 += alt.Chart(data).mark_bar().encode(x="x", y="count()")
+# 原地修改，combined2 的 id 不变
+assert id(combined2) == original_id
+```
+
 ---
 
 ## 3. 编码继承与覆盖规则
@@ -668,6 +876,302 @@ def test_layer_facet(basic_chart):
     
     dct = chart.to_dict()
     assert "data" in dct
+```
+
+### 5.2.4 重复图表与分面图表的数据继承策略
+
+**核心差异**：`RepeatChart` 和 `FacetChart` 通过单一 `spec` 字段承载内容，而不是列表形式的 `layer`、`hconcat`、`vconcat`。这导致它们的数据继承路径与分层、拼接类图表有本质区别。
+
+#### 5.2.4.1 四类复合图表的数据存储结构对比
+
+| 图表类型 | 子图表字段 | 字段类型 | 是否调用 `_combine_subchart_data` |
+|----------|------------|----------|------------------------------------|
+| `LayerChart` | `layer` | `list[ChartType]` | ✅ 是 |
+| `HConcatChart` | `hconcat` | `list[ChartType]` | ✅ 是 |
+| `VConcatChart` | `vconcat` | `list[ChartType]` | ✅ 是 |
+| `ConcatChart` | `concat` | `list[ChartType]` | ✅ 是 |
+| `RepeatChart` | `spec` | `ChartType` (单一对象) | ❌ 否 |
+| `FacetChart` | `spec` | `ChartType` (单一对象) | ❌ 否 |
+
+#### 5.2.4.2 `FacetChart` 的数据处理机制
+
+**双重处理路径**：
+1. **通过 `.facet()` 方法创建**（推荐）：自动处理数据提升
+2. **直接实例化 `FacetChart`**：不自动处理数据
+
+**路径 1：通过 `.facet()` 方法（`api.py:3979-3989`）**
+
+```python
+# _EncodingMixin.facet() 方法中的数据处理
+if data is Undefined:
+    if self.data is Undefined:
+        msg = (
+            "Facet charts require data to be specified at the top level. "
+            "If you are trying to facet layered or concatenated charts, "
+            "ensure that the same data variable is passed to each chart "
+            "or specify the data inside the facet method instead."
+        )
+        raise ValueError(msg)
+    self = _top_schema_base(self).copy(deep=False)
+    data, self.data = self.data, Undefined  # ✅ 将数据从 spec 提升到顶层
+```
+
+**行为分析**：
+- 如果用户未显式传入 `data`，则从 `self.data` 提取
+- 将 `self.data` 设置为 `Undefined`
+- 将提取的数据作为 `FacetChart` 的顶层 `data`
+- 这确保了分面图表的数据在顶层，符合 Vega-Lite 规范
+
+**路径 2：直接实例化 `FacetChart`（`api.py:5002-5017`）**
+
+```python
+def __init__(
+    self,
+    data: Optional[ChartDataType] = Undefined,
+    spec: Optional[ChartType] = Undefined,
+    facet: Optional[dict[str, Any] | SchemaBase] = Undefined,
+    params: Optional[Sequence[_Parameter]] = Undefined,
+    **kwargs: Any,
+) -> None:
+    # 只调用 _combine_subchart_params，不调用 _combine_subchart_data
+    _spec_as_list = [spec]
+    params, _spec_as_list = _combine_subchart_params(params, _spec_as_list)
+    spec = _spec_as_list[0]
+    super().__init__(data=data, spec=spec, facet=facet, params=params, **kwargs)
+```
+
+**行为分析**：
+- 只处理参数（选择器），不处理数据
+- 如果用户同时传入 `data` 和 `spec`（且 `spec.data` 有数据），会导致数据重复定义
+- 推荐使用 `.facet()` 方法而非直接实例化
+
+#### 5.2.4.3 `RepeatChart` 的数据处理机制
+
+**更简单的路径**：`RepeatChart` 没有自动的数据提升机制。
+
+**通过 `.repeat()` 方法创建（`api.py:2507-2509`）**
+
+```python
+return RepeatChart(
+    spec=t.cast("ChartType", self), repeat=repeat_arg, columns=columns, **kwargs
+)
+```
+
+**行为分析**：
+- 只是简单地将 `self` 作为 `spec` 传入
+- **没有**任何数据处理逻辑
+- 数据留在 `RepeatChart.spec.data` 中，而非顶层
+
+**直接实例化 `RepeatChart`（`api.py:4337-4398`）**
+
+```python
+def __init__(
+    self,
+    repeat: Optional[list[str] | LayerRepeatMapping | RepeatMapping] = Undefined,
+    spec: Optional[ChartType] = Undefined,
+    data: Optional[ChartDataType] = Undefined,  # 可选择传入顶层数据
+    ...
+) -> None:
+    _spec_as_list = [spec]
+    params, _spec_as_list = _combine_subchart_params(params, _spec_as_list)
+    spec = _spec_as_list[0]
+    super().__init__(
+        repeat=repeat,
+        spec=spec,
+        data=data,  # 直接传入，不做处理
+        ...
+    )
+```
+
+**行为分析**：
+- 用户可以选择显式传入 `data` 参数作为顶层数据
+- 但如果 `spec` 也有 `data`，两者会并存
+- 没有自动合并或提升机制
+
+#### 5.2.4.4 实际使用场景对比
+
+**场景 1：简单图表分面（推荐使用 `.facet()`）**
+
+```python
+import pandas as pd
+import altair as alt
+
+data = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6], "category": ["A", "B", "A"]})
+
+# ✅ 推荐：使用 .facet() 方法，数据自动提升
+chart = alt.Chart(data).mark_point().encode(x="x", y="y")
+faceted = chart.facet(row="category")
+
+# 结果：
+# - faceted.data = data（顶层数据）
+# - faceted.spec.data = Undefined（数据被移除）
+assert faceted.data is data
+assert faceted.spec.data is Undefined
+```
+
+**场景 2：分层图表分面**
+
+```python
+import pandas as pd
+import altair as alt
+
+data = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6], "category": ["A", "B", "A"]})
+
+# 先创建分层图表（数据会被合并）
+points = alt.Chart(data).mark_point().encode(x="x", y="y")
+lines = alt.Chart(data).mark_line().encode(x="x", y="mean(y)")
+layered = points + lines
+
+# 结果：
+# - layered.data = data（提升到顶层）
+# - layered.layer[0].data = Undefined
+# - layered.layer[1].data = Undefined
+
+# 再分面
+faceted = layered.facet(row="category")
+
+# 结果：
+# - faceted.data = data（从 layered.data 提升）
+# - faceted.spec.data = Undefined
+# - faceted.spec.layer[0].data = Undefined
+# - faceted.spec.layer[1].data = Undefined
+```
+
+**场景 3：简单图表重复（`.repeat()` 不处理数据）**
+
+```python
+import pandas as pd
+import altair as alt
+
+data = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "c": [7, 8, 9]})
+
+# 使用 .repeat() 方法
+base = alt.Chart(data).mark_point().encode(
+    x=alt.X(alt.repeat("column"), type="quantitative"),
+    y="b"
+)
+repeated = base.repeat(column=["a", "c"])
+
+# 结果：
+# - repeated.data = Undefined（顶层无数据）
+# - repeated.spec.data = data（数据留在 spec 中）
+assert repeated.data is Undefined
+assert repeated.spec.data is data
+
+# 序列化后的输出：
+# {
+#   "repeat": {"column": ["a", "c"]},
+#   "spec": {
+#     "data": {"values": ...},  # 数据在 spec 中
+#     "mark": "point",
+#     ...
+#   }
+# }
+```
+
+**场景 4：显式给 RepeatChart 传入顶层数据**
+
+```python
+import pandas as pd
+import altair as alt
+
+data = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "c": [7, 8, 9]})
+
+# 方式 1：通过 .repeat() 的 kwargs 传入
+base = alt.Chart().mark_point().encode(  # 注意：这里不指定数据
+    x=alt.X(alt.repeat("column"), type="quantitative"),
+    y="b"
+)
+repeated1 = base.repeat(column=["a", "c"], data=data)  # 通过 kwargs 传入
+
+# 方式 2：直接实例化
+base = alt.Chart().mark_point().encode(
+    x=alt.X(alt.repeat("column"), type="quantitative"),
+    y="b"
+)
+repeated2 = alt.RepeatChart(spec=base, data=data, repeat={"column": ["a", "c"]})
+
+# 结果（两种方式相同）：
+# - repeated.data = data（顶层有数据）
+# - repeated.spec.data = Undefined（spec 无数据）
+```
+
+#### 5.2.4.5 序列化后的规范差异
+
+**FacetChart（通过 `.facet()` 创建）**
+
+```json
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": {"values": [{"x": 1, "y": 4, "category": "A"}, ...]},  // 数据在顶层
+  "facet": {"row": {"field": "category", "type": "nominal"}},
+  "spec": {
+    // spec 中无 data
+    "mark": "point",
+    "encoding": {"x": {"field": "x"}, "y": {"field": "y"}}
+  }
+}
+```
+
+**RepeatChart（通过 `.repeat()` 创建）**
+
+```json
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "repeat": {"column": ["a", "c"]},
+  "spec": {
+    "data": {"values": [{"a": 1, "b": 4, "c": 7}, ...]},  // 数据在 spec 中
+    "mark": "point",
+    "encoding": {
+      "x": {"field": {"repeat": "column"}, "type": "quantitative"},
+      "y": {"field": "b", "type": "quantitative"}
+    }
+  }
+}
+```
+
+**RepeatChart（显式传入顶层数据）**
+
+```json
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": {"values": [{"a": 1, "b": 4, "c": 7}, ...]},  // 数据在顶层
+  "repeat": {"column": ["a", "c"]},
+  "spec": {
+    // spec 中无 data
+    "mark": "point",
+    "encoding": {
+      "x": {"field": {"repeat": "column"}, "type": "quantitative"},
+      "y": {"field": "b", "type": "quantitative"}
+    }
+  }
+}
+```
+
+#### 5.2.4.6 最佳实践总结
+
+| 场景 | 推荐方式 | 原因 |
+|------|----------|------|
+| 简单图表分面 | `chart.facet(...)` | 自动处理数据提升，符合 Vega-Lite 规范 |
+| 分层/拼接图表分面 | `(chart1 + chart2).facet(...)` | 先合并数据，再提升到顶层 |
+| 简单图表重复 | `chart.repeat(...)` | 数据留在 spec 中，Vega-Lite 支持 |
+| 重复图表需要顶层数据 | `chart.repeat(..., data=data)` 或 `alt.RepeatChart(spec=..., data=data)` | 显式传入顶层数据 |
+| 嵌套复合（如重复+分面） | 逐步构建，注意数据位置 | 复杂嵌套时需手动管理数据位置 |
+
+**常见陷阱**：
+
+```python
+# ❌ 陷阱：分层后重复，数据位置混乱
+data = pd.DataFrame(...)
+points = alt.Chart(data).mark_point()
+lines = alt.Chart(data).mark_line()
+layered = points + lines  # layered.data = data, layered.layer[*].data = Undefined
+repeated = layered.repeat(...)  # repeated.data = Undefined, repeated.spec.data = data
+
+# ✅ 正确做法：显式传入顶层数据
+repeated = layered.repeat(..., data=data)  # 或者在 repeat 时传入
+# 或者使用 alt.RepeatChart 显式构造
+repeated = alt.RepeatChart(spec=layered, data=data, repeat=...)
 ```
 
 ### 5.3 参数（选择器）的合并策略
